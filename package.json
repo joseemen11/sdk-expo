@@ -1,0 +1,22 @@
+{
+  "name": "@privado-id/expo-sdk",
+  "version": "0.1.0",
+  "description": "Privado ID SDK for Expo and React Native.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test:smoke": "node scripts/smoke.cjs",
+    "smoke": "npm run test:smoke",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

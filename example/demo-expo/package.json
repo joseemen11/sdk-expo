@@ -1,0 +1,21 @@
+{
+  "name": "privado-id-expo-sdk-demo",
+  "version": "0.1.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "android": "expo run:android",
+    "start": "expo start --dev-client",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@privado-id/expo-sdk": "file:../..",
+    "expo": "~52.0.0",
+    "react": "18.3.1",
+    "react-native": "0.76.5"
+  },
+  "devDependencies": {
+    "@types/react": "~18.3.12",
+    "typescript": "^5.6.3"
+  }
+}

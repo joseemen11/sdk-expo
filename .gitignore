@@ -1,0 +1,8 @@
+dist/
+node_modules/
+npm-debug.log*
+.expo/
+.expo-shared/
+
+example/demo-expo/node_modules/*
+docs
