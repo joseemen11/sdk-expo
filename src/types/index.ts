@@ -67,8 +67,12 @@ export interface StorageAdapter<TRecord = unknown> {
 }
 
 export interface SecureKeyStore {
+  getItem(key: string): Promise<string | undefined>;
+  setItem(key: string, value: string): Promise<void>;
+  deleteItem(key: string): Promise<void>;
+  getOrCreateEncryptionKey(alias: string): Promise<Uint8Array>;
   getOrCreateKey(alias: string): Promise<Uint8Array>;
-  deleteKey?(alias: string): Promise<void>;
+  deleteKey(alias: string): Promise<void>;
 }
 
 export interface StoredCredentialRecord {
@@ -84,6 +88,8 @@ export interface CredentialStorageAdapter {
   saveCredential(credential: unknown): Promise<ImportedCredentialSummary>;
   getCredentials(): Promise<ImportedCredentialSummary[]>;
   getCredentialById(id: string): Promise<unknown | undefined>;
+  deleteCredential(id: string): Promise<void>;
+  clearCredentials(): Promise<void>;
 }
 
 export interface KMSAdapter {
@@ -143,6 +149,8 @@ export interface ImportedCredentialSummary {
   credentialSubjectId?: string;
   expirationDate?: string;
   proofTypes: string[];
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ClaimCredentialInput {

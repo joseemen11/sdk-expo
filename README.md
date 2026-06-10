@@ -7,9 +7,10 @@ The first target is Android with an Expo development build. Expo Go is not a tar
 ## Current Scope
 
 - Explicit SDK configuration through `PrivadoExpoConfig`.
-- Secure-storage interfaces for encryption keys and credentials.
-- Development-only encrypted in-memory credential storage for this first block.
+- Secure-storage interfaces and adapters for encryption keys and credentials.
+- Persistent encrypted credential storage through SecureStore-backed keys and SQLite-backed encrypted records in the demo app.
 - VC JSON import, save, list, and lookup.
+- Credential delete and clear operations.
 - Safe credential summaries that exclude full claims.
 - Pure builders for SigV2 and MTPV2 proof requests.
 - On-chain challenge encoding with little-endian address conversion.
@@ -54,9 +55,9 @@ const summaries = await sdk.getCredentials();
 
 ## Storage
 
-Credential material must not be persisted in unencrypted app storage. This block includes the final adapter shape plus a development-only encrypted memory implementation so API integration can start without pretending that production storage is complete.
+Credential material must not be persisted in unencrypted app storage. `EncryptedCredentialStorage` encrypts each credential payload with XChaCha20-Poly1305 before it reaches the record store. The demo app stores the encryption key through `expo-secure-store` and stores encrypted records through `expo-sqlite`.
 
-For production mobile use, provide a `SecureKeyStore` backed by platform secure storage and a `CredentialStorageAdapter` backed by an encrypted database or equivalent native storage.
+The SDK core stays adapter-based. Mobile apps can inject `ExpoSecureKeyStore`, `SQLiteCredentialRecordStore`, or stricter production adapters without changing the public client API.
 
 ## ZK Boundary
 

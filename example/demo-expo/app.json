@@ -9,6 +9,11 @@
     ],
     "android": {
       "package": "com.privadoid.exposdkdemo"
-    }
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-sqlite",
+      "expo-asset"
+    ]
   }
 }

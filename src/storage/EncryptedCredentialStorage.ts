@@ -1,56 +1,85 @@
 import { buildCredentialSummary } from "../credentials/diagnostics";
-import { bytesToBase64, base64ToBytes, bytesToText, textToBytes } from "../network/Base64UrlCodec";
 import type { CredentialStorageAdapter, ImportedCredentialSummary, SecureKeyStore, StoredCredentialRecord } from "../types";
+import { encryptCredentialPayload, decryptCredentialPayload } from "./CredentialCipher";
+import { InMemoryCredentialRecordStore, type CredentialRecordStore } from "./CredentialRecordStore";
+import { createEncryptionKey } from "./createEncryptionKey";
 
 export interface EncryptedCredentialStorageOptions {
   keyAlias?: string;
   secureKeyStore: SecureKeyStore;
+  recordStore?: CredentialRecordStore;
+  randomBytes?: (byteLength: number) => Uint8Array;
 }
 
 export class EncryptedCredentialStorage implements CredentialStorageAdapter {
-  private readonly records = new Map<string, StoredCredentialRecord>();
   private key?: Uint8Array;
   private readonly keyAlias: string;
   private readonly secureKeyStore: SecureKeyStore;
+  private readonly recordStore: CredentialRecordStore;
+  private readonly randomBytes?: (byteLength: number) => Uint8Array;
 
   constructor(options: EncryptedCredentialStorageOptions) {
     this.keyAlias = options.keyAlias ?? "privado-id.credentials.v1";
     this.secureKeyStore = options.secureKeyStore;
+    this.recordStore = options.recordStore ?? new InMemoryCredentialRecordStore();
+    this.randomBytes = options.randomBytes;
   }
 
   async init(): Promise<void> {
-    this.key = await this.secureKeyStore.getOrCreateKey(this.keyAlias);
+    await this.recordStore.init?.();
+    this.key = await this.secureKeyStore.getOrCreateEncryptionKey(this.keyAlias);
   }
 
   async saveCredential(credential: unknown): Promise<ImportedCredentialSummary> {
     const key = await this.requireKey();
-    const summary = buildCredentialSummary(credential);
+    const baseSummary = buildCredentialSummary(credential);
     const now = new Date().toISOString();
-    const encryptedPayload = encryptDevelopmentPayload(JSON.stringify(credential), key);
-    const existing = this.records.get(summary.id);
+    const existing = await this.recordStore.get(baseSummary.id);
+    const createdAt = existing?.createdAt ?? now;
+    const updatedAt = now;
+    const summary = withTimestamps(baseSummary, createdAt, updatedAt);
+    const encryptedPayload = await encryptCredentialPayload({
+      credential,
+      key,
+      nonce: this.createNonce(),
+      associatedData: associatedDataForCredential(baseSummary.id)
+    });
 
-    this.records.set(summary.id, {
+    await this.recordStore.upsert({
       id: summary.id,
       encryptedPayload,
       summary,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
+      createdAt,
+      updatedAt
     });
 
     return summary;
   }
 
   async getCredentials(): Promise<ImportedCredentialSummary[]> {
-    return [...this.records.values()].map((record) => ({ ...record.summary }));
+    const records = await this.recordStore.list();
+    return records.map((record) => withTimestamps(record.summary, record.createdAt, record.updatedAt));
   }
 
   async getCredentialById(id: string): Promise<unknown | undefined> {
-    const record = this.records.get(id);
+    const record = await this.recordStore.get(id);
     if (!record) {
       return undefined;
     }
     const key = await this.requireKey();
-    return JSON.parse(decryptDevelopmentPayload(record.encryptedPayload, key)) as unknown;
+    return decryptCredentialPayload({
+      encryptedPayload: record.encryptedPayload,
+      key,
+      associatedData: associatedDataForCredential(id)
+    });
+  }
+
+  async deleteCredential(id: string): Promise<void> {
+    await this.recordStore.delete(id);
+  }
+
+  async clearCredentials(): Promise<void> {
+    await this.recordStore.clear();
   }
 
   private async requireKey(): Promise<Uint8Array> {
@@ -62,21 +91,29 @@ export class EncryptedCredentialStorage implements CredentialStorageAdapter {
     }
     return this.key;
   }
-}
 
-function encryptDevelopmentPayload(value: string, key: Uint8Array): string {
-  const plain = textToBytes(value);
-  return bytesToBase64(xorBytes(plain, key));
-}
-
-function decryptDevelopmentPayload(value: string, key: Uint8Array): string {
-  return bytesToText(xorBytes(base64ToBytes(value), key));
-}
-
-function xorBytes(input: Uint8Array, key: Uint8Array): Uint8Array {
-  const output = new Uint8Array(input.length);
-  for (let i = 0; i < input.length; i += 1) {
-    output[i] = input[i] ^ key[i % key.length];
+  private createNonce(): Uint8Array {
+    if (this.randomBytes) {
+      return this.randomBytes(24);
+    }
+    return createEncryptionKey({ byteLength: 24 });
   }
-  return output;
+}
+
+function associatedDataForCredential(id: string): string {
+  return `privado-id-expo-sdk:credential:${id}`;
+}
+
+function withTimestamps(
+  summary: ImportedCredentialSummary,
+  createdAt: string,
+  updatedAt: string
+): ImportedCredentialSummary {
+  return {
+    ...summary,
+    type: [...summary.type],
+    proofTypes: [...summary.proofTypes],
+    createdAt,
+    updatedAt
+  };
 }

@@ -1,6 +1,19 @@
 import { useMemo, useState } from "react";
+import * as Crypto from "expo-crypto";
+import * as SecureStore from "expo-secure-store";
+import * as SQLite from "expo-sqlite";
 import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, View } from "react-native";
-import { createPrivadoExpoClient, type ImportedCredentialSummary, type PrivadoExpoConfig } from "@privado-id/expo-sdk";
+import {
+  EncryptedCredentialStorage,
+  ExpoSecureKeyStore,
+  SQLiteCredentialRecordStore,
+  createPrivadoExpoClient,
+  safeCredentialDiagnostics,
+  type ImportedCredentialSummary,
+  type PrivadoExpoClient,
+  type PrivadoExpoConfig,
+  type SQLiteDatabaseLike
+} from "@privado-id/expo-sdk";
 
 const config: PrivadoExpoConfig = {
   network: {
@@ -54,10 +67,39 @@ const sampleCredential = {
 };
 
 export default function App() {
-  const sdk = useMemo(() => createPrivadoExpoClient(config), []);
+  const sdkRef = useMemo<{ current?: PrivadoExpoClient }>(() => ({}), []);
   const [importedCredential, setImportedCredential] = useState<unknown>();
   const [summaries, setSummaries] = useState<ImportedCredentialSummary[]>([]);
   const [status, setStatus] = useState("Ready");
+
+  async function getSdk(): Promise<PrivadoExpoClient> {
+    if (sdkRef.current) {
+      return sdkRef.current;
+    }
+
+    const database = await SQLite.openDatabaseAsync("privado_id_credentials.db");
+    const secureKeyStore = new ExpoSecureKeyStore({
+      secureStore: SecureStore,
+      secureStoreOptions: {
+        keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY
+      },
+      randomBytes: Crypto.getRandomBytes
+    });
+    const recordStore = new SQLiteCredentialRecordStore({
+      database: toSQLiteDatabaseLike(database)
+    });
+    const credentialStorage = new EncryptedCredentialStorage({
+      secureKeyStore,
+      recordStore,
+      randomBytes: Crypto.getRandomBytes
+    });
+
+    sdkRef.current = createPrivadoExpoClient(config, {
+      secureKeyStore,
+      credentialStorage
+    });
+    return sdkRef.current;
+  }
 
   async function run(label: string, action: () => Promise<unknown> | unknown) {
     try {
@@ -72,12 +114,23 @@ export default function App() {
     <SafeAreaView style={styles.safe}>
       <ScrollView contentContainerStyle={styles.container}>
         <Text style={styles.title}>Privado ID SDK Demo</Text>
+        <Text style={styles.note}>Encrypted SQLite payloads with the encryption key in SecureStore.</Text>
         <View style={styles.toolbar}>
-          <DemoButton label="Init SDK" onPress={() => run("Init", () => sdk.init().then(() => "initialized"))} />
+          <DemoButton
+            label="Init SDK"
+            onPress={() =>
+              run("Init", async () => {
+                const sdk = await getSdk();
+                await sdk.init();
+                return "initialized";
+              })
+            }
+          />
           <DemoButton
             label="Import VC JSON"
             onPress={() =>
-              run("Import", () => {
+              run("Import", async () => {
+                const sdk = await getSdk();
                 const imported = sdk.importCredentialFromJson(JSON.stringify(sampleCredential));
                 setImportedCredential(imported.credential);
                 return imported.summary;
@@ -85,9 +138,10 @@ export default function App() {
             }
           />
           <DemoButton
-            label="Save credential"
+            label="Save credential securely"
             onPress={() =>
               run("Save", async () => {
+                const sdk = await getSdk();
                 const imported = importedCredential ?? sdk.importCredentialFromJson(JSON.stringify(sampleCredential)).credential;
                 const summary = await sdk.saveCredential(imported);
                 setSummaries(await sdk.getCredentials());
@@ -99,6 +153,7 @@ export default function App() {
             label="List credentials"
             onPress={() =>
               run("List", async () => {
+                const sdk = await getSdk();
                 const list = await sdk.getCredentials();
                 setSummaries(list);
                 return list;
@@ -106,47 +161,38 @@ export default function App() {
             }
           />
           <DemoButton
-            label="Build off-chain MTP request"
+            label="Get credential by ID"
             onPress={() =>
-              run("Off-chain MTP", () =>
-                sdk.buildOffchainProofRequest({
-                  proofKind: "mtp",
-                  credentialType: "KYCAgeCredential",
-                  credentialSchema: "https://schema.example/kyc-age.json"
-                })
-              )
+              run("Get", async () => {
+                const sdk = await getSdk();
+                const id = summaries[0]?.id ?? sampleCredential.id;
+                const credential = await sdk.getCredentialById(id);
+                return credential ? safeCredentialDiagnostics(credential) : "not found";
+              })
             }
           />
           <DemoButton
-            label="Build on-chain MTP request"
+            label="Delete credential"
             onPress={() =>
-              run("On-chain MTP", () =>
-                sdk.buildOnchainProofRequest({
-                  proofKind: "mtp",
-                  credentialType: "KYCAgeCredential",
-                  credentialSchema: "https://schema.example/kyc-age.json",
-                  verifierAddress: config.contracts.universalVerifierAddress
-                })
-              )
+              run("Delete", async () => {
+                const sdk = await getSdk();
+                const id = summaries[0]?.id ?? sampleCredential.id;
+                await sdk.deleteCredential(id);
+                const list = await sdk.getCredentials();
+                setSummaries(list);
+                return { deleted: id, remaining: list.length };
+              })
             }
           />
           <DemoButton
-            label="Prepare UniversalVerifier payload"
+            label="Clear credentials"
             onPress={() =>
-              run("Payload", () =>
-                sdk.prepareUniversalVerifierPayload({
-                  requestId: 1,
-                  proof: {
-                    circuitId: "credentialAtomicQueryMTPV2OnChain" as never,
-                    proof: { a: ["0", "0"], b: [["0", "0"], ["0", "0"]], c: ["0", "0"] },
-                    publicSignals: ["0"],
-                    request: sdk.buildOnchainProofRequest({
-                      proofKind: "mtp",
-                      verifierAddress: config.contracts.universalVerifierAddress
-                    })
-                  }
-                })
-              )
+              run("Clear", async () => {
+                const sdk = await getSdk();
+                await sdk.clearCredentials();
+                setSummaries([]);
+                return "cleared";
+              })
             }
           />
         </View>
@@ -162,6 +208,8 @@ export default function App() {
             <Text style={styles.summaryLine}>Issuer: {summary.issuer ?? "Unknown"}</Text>
             <Text style={styles.summaryLine}>Subject: {summary.credentialSubjectId ?? "Unknown"}</Text>
             <Text style={styles.summaryLine}>Proofs: {summary.proofTypes.join(", ") || "None"}</Text>
+            <Text style={styles.summaryLine}>Created: {summary.createdAt ?? "Unknown"}</Text>
+            <Text style={styles.summaryLine}>Updated: {summary.updatedAt ?? "Unknown"}</Text>
           </View>
         ))}
       </ScrollView>
@@ -187,6 +235,15 @@ function formatResult(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
+function toSQLiteDatabaseLike(database: SQLite.SQLiteDatabase): SQLiteDatabaseLike {
+  return {
+    execAsync: (source) => database.execAsync(source),
+    runAsync: (source, params = []) => database.runAsync(source, params as never),
+    getAllAsync: <T,>(source: string, params = []) => database.getAllAsync<T>(source, params as never),
+    getFirstAsync: <T,>(source: string, params = []) => database.getFirstAsync<T>(source, params as never)
+  };
+}
+
 const styles = StyleSheet.create({
   safe: {
     flex: 1,
@@ -200,6 +257,11 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: "700",
     color: "#111827"
+  },
+  note: {
+    color: "#4b5563",
+    fontSize: 13,
+    lineHeight: 18
   },
   toolbar: {
     gap: 10

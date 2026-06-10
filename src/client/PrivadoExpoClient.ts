@@ -1,6 +1,8 @@
 import { CircuitArtifactRegistry } from "../circuits/CircuitArtifactRegistry";
 import { CircuitId } from "../circuits/CircuitId";
 import { validatePrivadoExpoConfig } from "../config/validatePrivadoExpoConfig";
+import { clearCredentials } from "../credentials/clearCredentials";
+import { deleteCredential } from "../credentials/deleteCredential";
 import { getCredentialById } from "../credentials/getCredentialById";
 import { getCredentials } from "../credentials/getCredentials";
 import { importCredentialFromJson } from "../credentials/importCredentialFromJson";
@@ -74,6 +76,16 @@ export class PrivadoExpoClient {
   async getCredentialById(id: string): Promise<unknown | undefined> {
     await this.ensureInitialized();
     return getCredentialById(id, this.credentialStorage);
+  }
+
+  async deleteCredential(id: string): Promise<void> {
+    await this.ensureInitialized();
+    await deleteCredential(id, this.credentialStorage);
+  }
+
+  async clearCredentials(): Promise<void> {
+    await this.ensureInitialized();
+    await clearCredentials(this.credentialStorage);
   }
 
   async claimCredentialFromOffer(input: ClaimCredentialInput): Promise<unknown> {
