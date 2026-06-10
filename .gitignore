@@ -5,4 +5,3 @@ npm-debug.log*
 .expo-shared/
 
 example/demo-expo/node_modules/*
-docs

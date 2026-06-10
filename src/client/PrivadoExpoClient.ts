@@ -7,7 +7,13 @@ import { getCredentialById } from "../credentials/getCredentialById";
 import { getCredentials } from "../credentials/getCredentials";
 import { importCredentialFromJson } from "../credentials/importCredentialFromJson";
 import { saveCredential } from "../credentials/saveCredential";
+import { createOrLoadHolderDid } from "../identity/createOrLoadHolderDid";
+import { deleteHolderIdentity } from "../identity/deleteHolderIdentity";
+import { EncryptedIdentityStorage } from "../identity/EncryptedIdentityStorage";
+import { getHolderDid } from "../identity/getHolderDid";
 import { claimCredentialFromOffer } from "../issuer/claimCredentialFromOffer";
+import { BjjKmsAdapter } from "../kms/BjjKmsAdapter";
+import { signChallenge } from "../kms/signChallenge";
 import { checkProofVerified } from "../onchain/checkProofVerified";
 import { prepareUniversalVerifierPayload as preparePayload } from "../onchain/prepareUniversalVerifierPayload";
 import { generateOffchainProof } from "../proofs/generateOffchainProof";
@@ -24,12 +30,20 @@ import type {
   CheckProofVerifiedInput,
   ClaimCredentialInput,
   CredentialStorageAdapter,
+  CreateOrLoadHolderDidInput,
+  CreateOrLoadHolderDidResult,
+  DeleteHolderIdentityResult,
   GenerateProofInput,
   GeneratedProof,
+  HolderDidSummary,
+  IdentityStorageAdapter,
   ImportedCredentialSummary,
+  KMSAdapter,
   PrivadoExpoClientAdapters,
   PrivadoExpoConfig,
   ProofRequest,
+  SignChallengeInput,
+  SignChallengeResult,
   SubmitProofInput,
   UniversalVerifierPayload
 } from "../types";
@@ -38,6 +52,8 @@ export class PrivadoExpoClient {
   readonly config: PrivadoExpoConfig;
   readonly circuitRegistry: CircuitArtifactRegistry;
   private readonly credentialStorage: CredentialStorageAdapter;
+  private readonly identityStorage: IdentityStorageAdapter;
+  private readonly kmsAdapter: KMSAdapter;
   private readonly adapters: PrivadoExpoClientAdapters;
   private initialized = false;
 
@@ -47,12 +63,16 @@ export class PrivadoExpoClient {
     const secureKeyStore = adapters.secureKeyStore ?? new DevelopmentSecureKeyStore();
     this.credentialStorage =
       adapters.credentialStorage ?? new EncryptedCredentialStorage({ secureKeyStore });
+    this.identityStorage =
+      adapters.identityStorage ?? new EncryptedIdentityStorage({ secureKeyStore });
+    this.kmsAdapter = adapters.kmsAdapter ?? new BjjKmsAdapter();
     this.circuitRegistry = new CircuitArtifactRegistry(this.config.circuits);
   }
 
   async init(): Promise<void> {
     this.circuitRegistry.validate();
     await this.credentialStorage.init?.();
+    await this.identityStorage.init?.();
     this.initialized = true;
   }
 
@@ -86,6 +106,37 @@ export class PrivadoExpoClient {
   async clearCredentials(): Promise<void> {
     await this.ensureInitialized();
     await clearCredentials(this.credentialStorage);
+  }
+
+  async createOrLoadHolderDid(input: CreateOrLoadHolderDidInput = {}): Promise<CreateOrLoadHolderDidResult> {
+    await this.ensureInitialized();
+    return createOrLoadHolderDid({
+      request: input,
+      identityStorage: this.identityStorage,
+      kmsAdapter: this.kmsAdapter,
+      holderDidProvider: this.adapters.holderDidProvider,
+      realHolderDidProvider: this.adapters.realHolderDidProvider,
+      developmentHolderDidProvider: this.adapters.developmentHolderDidProvider
+    });
+  }
+
+  async getHolderDid(): Promise<HolderDidSummary | undefined> {
+    await this.ensureInitialized();
+    return getHolderDid(this.identityStorage);
+  }
+
+  async signChallenge(input: SignChallengeInput): Promise<SignChallengeResult> {
+    await this.ensureInitialized();
+    return signChallenge({
+      request: input,
+      kmsAdapter: this.kmsAdapter,
+      identityStorage: this.identityStorage
+    });
+  }
+
+  async deleteHolderIdentity(): Promise<DeleteHolderIdentityResult> {
+    await this.ensureInitialized();
+    return deleteHolderIdentity(this.identityStorage, this.kmsAdapter);
   }
 
   async claimCredentialFromOffer(input: ClaimCredentialInput): Promise<unknown> {

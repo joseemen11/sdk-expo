@@ -1,7 +1,11 @@
 const {
+  DevelopmentOnlyHolderDidProvider,
+  DevelopmentOnlyKmsAdapter,
   DevelopmentSecureKeyStore,
   EncryptedCredentialStorage,
+  EncryptedIdentityStorage,
   InMemoryCredentialRecordStore,
+  SecurePrivateKeyStore,
   addressToUint256LE,
   createPrivadoExpoClient
 } = require("../dist/index.js");
@@ -12,6 +16,15 @@ async function main() {
   const credentialStorage = new EncryptedCredentialStorage({
     secureKeyStore,
     recordStore
+  });
+  const identityStorage = new EncryptedIdentityStorage({
+    secureKeyStore
+  });
+  const privateKeyStore = new SecurePrivateKeyStore({
+    secureKeyStore
+  });
+  const kmsAdapter = new DevelopmentOnlyKmsAdapter({
+    privateKeyStore
   });
   const sdk = createPrivadoExpoClient({
     network: {
@@ -31,7 +44,10 @@ async function main() {
     }
   }, {
     secureKeyStore,
-    credentialStorage
+    credentialStorage,
+    identityStorage,
+    kmsAdapter,
+    developmentHolderDidProvider: new DevelopmentOnlyHolderDidProvider()
   });
 
   await sdk.init();
@@ -84,6 +100,41 @@ async function main() {
   await sdk.clearCredentials();
   assert((await sdk.getCredentials()).length === 0, "expected clear credentials");
 
+  await expectRejects(
+    () => sdk.createOrLoadHolderDid({ mode: "real", method: "iden3", network: "amoy" }),
+    "Real Privado ID holder creation is not configured."
+  );
+
+  const holder = await sdk.createOrLoadHolderDid({
+    mode: "development",
+    method: "development",
+    network: "amoy"
+  });
+  const loaded = await sdk.createOrLoadHolderDid({
+    mode: "development",
+    method: "development",
+    network: "amoy"
+  });
+  const summary = await sdk.getHolderDid();
+  assert(holder.isNew === true, "expected first holder DID call to create identity");
+  assert(loaded.isNew === false, "expected second holder DID call to load identity");
+  assert(holder.did === loaded.did, "expected holder DID to persist between calls");
+  assert(summary && summary.did === holder.did, "expected getHolderDid to return active identity");
+  assert(holder.developmentOnly === true, "expected smoke holder DID to be developmentOnly");
+  assert(!("privateKey" in holder), "holder result must not expose private key");
+  assert(!("seed" in holder), "holder result must not expose seed");
+
+  const signature = await sdk.signChallenge({
+    challenge: "smoke-challenge"
+  });
+  assert(signature.keyId === holder.keyId, "expected challenge signature to use holder key");
+  assert(signature.signature.length > 0, "expected challenge signature");
+  assert(signature.developmentOnly === true, "expected smoke signature to be developmentOnly");
+
+  const deleted = await sdk.deleteHolderIdentity();
+  assert(deleted.deleted === true, "expected delete holder identity");
+  assert((await sdk.getHolderDid()) === undefined, "expected holder DID to be removed");
+
   console.info("smoke ok");
 }
 
@@ -91,6 +142,17 @@ function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+async function expectRejects(action, expectedMessage) {
+  try {
+    await action();
+  } catch (error) {
+    assert(error instanceof Error, "expected controlled error");
+    assert(error.message === expectedMessage, `expected error message: ${expectedMessage}`);
+    return;
+  }
+  throw new Error("expected action to reject");
 }
 
 main().catch((error) => {

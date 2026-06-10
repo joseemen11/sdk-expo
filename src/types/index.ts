@@ -92,9 +92,105 @@ export interface CredentialStorageAdapter {
   clearCredentials(): Promise<void>;
 }
 
+export interface HolderIdentity {
+  did: string;
+  keyId: string;
+  method?: string;
+  network?: string;
+  createdAt: string;
+  updatedAt: string;
+  developmentOnly?: boolean;
+}
+
+export interface HolderDidRecord {
+  did: string;
+  keyId: string;
+  method?: string;
+  network?: string;
+  createdAt: string;
+  updatedAt: string;
+  developmentOnly?: boolean;
+}
+
+export interface HolderDidSummary {
+  did: string;
+  keyId: string;
+  method?: string;
+  network?: string;
+  createdAt: string;
+  updatedAt: string;
+  developmentOnly?: boolean;
+}
+
+export interface IdentityStorageAdapter {
+  init?(): Promise<void>;
+  getHolderDid(): Promise<HolderDidSummary | undefined>;
+  saveHolderDid(record: HolderDidRecord): Promise<HolderDidSummary>;
+  deleteHolderIdentity(): Promise<DeleteHolderIdentityResult>;
+}
+
+export interface PrivateKeyStoreAdapter {
+  ensureKey(keyId: string): Promise<{ keyId: string; created: boolean }>;
+  deleteKey(keyId: string): Promise<void>;
+}
+
+export interface KMSKeyHandle {
+  keyId: string;
+  algorithm: string;
+  created: boolean;
+  developmentOnly?: boolean;
+}
+
 export interface KMSAdapter {
+  createOrLoadKey?(input: { keyId?: string; algorithm?: string }): Promise<KMSKeyHandle>;
+  signChallenge?(input: SignChallengeInput): Promise<SignChallengeResult>;
+  deleteKey?(keyId: string): Promise<void>;
   sign(payload: Uint8Array, keyId?: string): Promise<Uint8Array>;
   getPublicKey?(keyId?: string): Promise<Uint8Array>;
+}
+
+export interface CreateOrLoadHolderDidInput {
+  mode?: "real" | "development";
+  keyId?: string;
+  method?: string;
+  network?: string;
+}
+
+export interface CreateOrLoadHolderDidResult extends HolderDidSummary {
+  isNew: boolean;
+}
+
+export interface SignChallengeInput {
+  challenge: string | Uint8Array;
+  keyId?: string;
+}
+
+export interface SignChallengeResult {
+  keyId: string;
+  algorithm: string;
+  signature: string;
+  signatureEncoding: "base64";
+  developmentOnly?: boolean;
+}
+
+export interface DeleteHolderIdentityResult {
+  deleted: boolean;
+  did?: string;
+  keyId?: string;
+}
+
+export interface HolderDidProvider {
+  readonly developmentOnly?: boolean;
+  createDid(input: {
+    keyId: string;
+    method?: string;
+    network?: string;
+  }): Promise<{
+    did: string;
+    method?: string;
+    network?: string;
+    developmentOnly?: boolean;
+  }>;
 }
 
 export interface ProofRequest {
@@ -211,6 +307,11 @@ export interface AuthV2Provider {
 export interface PrivadoExpoClientAdapters {
   secureKeyStore?: SecureKeyStore;
   credentialStorage?: CredentialStorageAdapter;
+  identityStorage?: IdentityStorageAdapter;
+  kmsAdapter?: KMSAdapter;
+  holderDidProvider?: HolderDidProvider;
+  realHolderDidProvider?: HolderDidProvider;
+  developmentHolderDidProvider?: HolderDidProvider;
   zkProvider?: ZKProvider;
   rpcAdapter?: RPCAdapter;
   txSubmitter?: ZkpTxSubmitter;

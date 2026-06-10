@@ -11,6 +11,7 @@ The first target is Android with an Expo development build. Expo Go is not a tar
 - Persistent encrypted credential storage through SecureStore-backed keys and SQLite-backed encrypted records in the demo app.
 - VC JSON import, save, list, and lookup.
 - Credential delete and clear operations.
+- Holder DID API boundary for create/load/get/sign/delete.
 - Safe credential summaries that exclude full claims.
 - Pure builders for SigV2 and MTPV2 proof requests.
 - On-chain challenge encoding with little-endian address conversion.
@@ -52,6 +53,17 @@ const imported = sdk.importCredentialFromJson(rawVcJson);
 await sdk.saveCredential(imported.credential);
 const summaries = await sdk.getCredentials();
 ```
+
+## Holder DID
+
+The SDK exposes holder identity methods, but real BJJ-backed Privado ID holder creation is not wired in this block.
+
+```ts
+const holder = await sdk.createOrLoadHolderDid({ mode: "real" });
+const summary = await sdk.getHolderDid();
+```
+
+Real holder DID creation requires a configured Privado ID identity provider and BJJ KMS adapter. If the real provider is not configured, the SDK returns a controlled error. The demo app also exposes an explicit development mode to test persistence and challenge signing. Those demo identities are marked with `developmentOnly: true` and are not production Privado ID identities.
 
 ## Storage
 

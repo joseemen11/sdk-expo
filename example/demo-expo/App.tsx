@@ -4,11 +4,16 @@ import * as SecureStore from "expo-secure-store";
 import * as SQLite from "expo-sqlite";
 import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, View } from "react-native";
 import {
+  DevelopmentOnlyHolderDidProvider,
+  DevelopmentOnlyKmsAdapter,
   EncryptedCredentialStorage,
+  EncryptedIdentityStorage,
   ExpoSecureKeyStore,
   SQLiteCredentialRecordStore,
+  SecurePrivateKeyStore,
   createPrivadoExpoClient,
   safeCredentialDiagnostics,
+  type HolderDidSummary,
   type ImportedCredentialSummary,
   type PrivadoExpoClient,
   type PrivadoExpoConfig,
@@ -70,6 +75,7 @@ export default function App() {
   const sdkRef = useMemo<{ current?: PrivadoExpoClient }>(() => ({}), []);
   const [importedCredential, setImportedCredential] = useState<unknown>();
   const [summaries, setSummaries] = useState<ImportedCredentialSummary[]>([]);
+  const [holderDid, setHolderDid] = useState<HolderDidSummary>();
   const [status, setStatus] = useState("Ready");
 
   async function getSdk(): Promise<PrivadoExpoClient> {
@@ -93,10 +99,24 @@ export default function App() {
       recordStore,
       randomBytes: Crypto.getRandomBytes
     });
+    const identityStorage = new EncryptedIdentityStorage({
+      secureKeyStore
+    });
+    const privateKeyStore = new SecurePrivateKeyStore({
+      secureKeyStore,
+      randomBytes: Crypto.getRandomBytes
+    });
+    const kmsAdapter = new DevelopmentOnlyKmsAdapter({
+      privateKeyStore,
+      randomBytes: Crypto.getRandomBytes
+    });
 
     sdkRef.current = createPrivadoExpoClient(config, {
       secureKeyStore,
-      credentialStorage
+      credentialStorage,
+      identityStorage,
+      kmsAdapter,
+      developmentHolderDidProvider: new DevelopmentOnlyHolderDidProvider()
     });
     return sdkRef.current;
   }
@@ -195,6 +215,77 @@ export default function App() {
               })
             }
           />
+          <DemoButton
+            label="Create/load real Holder DID"
+            onPress={() =>
+              run("Real Holder DID", async () => {
+                const sdk = await getSdk();
+                const result = await sdk.createOrLoadHolderDid({
+                  mode: "real",
+                  method: "iden3",
+                  network: config.network.name
+                });
+                setHolderDid(result);
+                return result;
+              })
+            }
+          />
+          <DemoButton
+            label="Create/load development Holder DID"
+            onPress={() =>
+              run("Development Holder DID", async () => {
+                const sdk = await getSdk();
+                const result = await sdk.createOrLoadHolderDid({
+                  mode: "development",
+                  method: "development",
+                  network: config.network.name
+                });
+                setHolderDid(result);
+                return result;
+              })
+            }
+          />
+          <DemoButton
+            label="Get Holder DID"
+            onPress={() =>
+              run("Get Holder", async () => {
+                const sdk = await getSdk();
+                const result = await sdk.getHolderDid();
+                setHolderDid(result);
+                return result ?? "not found";
+              })
+            }
+          />
+          <DemoButton
+            label="Sign test challenge"
+            onPress={() =>
+              run("Sign", async () => {
+                const sdk = await getSdk();
+                const identity = holderDid ?? (await sdk.createOrLoadHolderDid({
+                  mode: "development",
+                  method: "development",
+                  network: config.network.name
+                }));
+                setHolderDid(identity);
+                const signature = await sdk.signChallenge({
+                  challenge: "privado-id-demo-challenge",
+                  keyId: identity.keyId
+                });
+                return summarizeSignature(signature);
+              })
+            }
+          />
+          <DemoButton
+            label="Delete Holder Identity"
+            onPress={() =>
+              run("Delete Holder", async () => {
+                const sdk = await getSdk();
+                const result = await sdk.deleteHolderIdentity();
+                setHolderDid(undefined);
+                return result;
+              })
+            }
+          />
         </View>
 
         <Text style={styles.sectionTitle}>Status</Text>
@@ -212,6 +303,21 @@ export default function App() {
             <Text style={styles.summaryLine}>Updated: {summary.updatedAt ?? "Unknown"}</Text>
           </View>
         ))}
+
+        <Text style={styles.sectionTitle}>Holder DID</Text>
+        {holderDid ? (
+          <View style={styles.summary}>
+            <Text style={styles.summaryTitle}>{holderDid.did}</Text>
+            <Text style={styles.summaryLine}>Key: {holderDid.keyId}</Text>
+            <Text style={styles.summaryLine}>Method: {holderDid.method ?? "Unknown"}</Text>
+            <Text style={styles.summaryLine}>Network: {holderDid.network ?? "Unknown"}</Text>
+            <Text style={styles.summaryLine}>Created: {holderDid.createdAt}</Text>
+            <Text style={styles.summaryLine}>Updated: {holderDid.updatedAt}</Text>
+            <Text style={styles.summaryLine}>Development only: {holderDid.developmentOnly ? "Yes" : "No"}</Text>
+          </View>
+        ) : (
+          <Text style={styles.status}>No holder identity loaded.</Text>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -233,6 +339,23 @@ function formatResult(value: unknown): string {
     return value;
   }
   return JSON.stringify(value, null, 2);
+}
+
+function summarizeSignature(value: {
+  keyId: string;
+  algorithm: string;
+  signature: string;
+  signatureEncoding: string;
+  developmentOnly?: boolean;
+}) {
+  return {
+    keyId: value.keyId,
+    algorithm: value.algorithm,
+    signatureEncoding: value.signatureEncoding,
+    signaturePreview: `${value.signature.slice(0, 12)}...`,
+    signatureLength: value.signature.length,
+    developmentOnly: value.developmentOnly
+  };
 }
 
 function toSQLiteDatabaseLike(database: SQLite.SQLiteDatabase): SQLiteDatabaseLike {
