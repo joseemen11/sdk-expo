@@ -1,22 +1,36 @@
-import { useMemo, useState } from "react";
+import "react-native-get-random-values";
+import { useMemo, useRef, useState } from "react";
 import * as Crypto from "expo-crypto";
+import * as FileSystem from "expo-file-system";
 import * as SecureStore from "expo-secure-store";
 import * as SQLite from "expo-sqlite";
-import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { unzip } from "react-native-zip-archive";
 import {
+  AuthV2ZKProvider,
+  CircuitArtifactDownloader,
+  CircuitArtifactStore,
+  CircuitId,
+  CircomWitnessNativeCalculator,
   DevelopmentOnlyHolderDidProvider,
-  DevelopmentOnlyKmsAdapter,
   EncryptedCredentialStorage,
   EncryptedIdentityStorage,
   ExpoSecureKeyStore,
+  MobileBjjKmsAdapter,
+  RapidsnarkNativeProver,
+  ReadOnlyMobileGistProofSource,
   SQLiteCredentialRecordStore,
-  SecurePrivateKeyStore,
+  SQLiteKeyValueStore,
   createPrivadoExpoClient,
   safeCredentialDiagnostics,
   type HolderDidSummary,
   type ImportedCredentialSummary,
   type PrivadoExpoClient,
   type PrivadoExpoConfig,
+  type CircuitArtifactDescriptor,
+  type CircuitArtifactDownloadStatus,
+  type CircuitArtifactFileSystemAdapter,
+  type ZipExtractor,
   type SQLiteDatabaseLike
 } from "@privado-id/expo-sdk";
 
@@ -71,11 +85,45 @@ const sampleCredential = {
   ]
 };
 
+const sampleCredentialOfferMessage = JSON.stringify(
+  {
+    id: "demo-offer-message",
+    typ: "application/iden3comm-plain-json",
+    type: "https://iden3-communication.io/credentials/1.0/offer",
+    thid: "demo-offer-thread",
+    from: config.issuer?.issuerDid,
+    body: {
+      url: `${config.issuer?.issuerBaseUrl}/v1/agent`,
+      credentials: [
+        {
+          id: "demo-credential-offer-id",
+          description: "Demo credential offer"
+        }
+      ]
+    }
+  },
+  null,
+  2
+);
+
+const defaultCircuitZipUrl = "https://gateway.wirawallet.com/circuits/keys.zip";
+const requiredDemoCircuits = [
+  CircuitId.AuthV2,
+  CircuitId.CredentialAtomicQuerySigV2,
+  CircuitId.CredentialAtomicQuerySigV2OnChain
+];
+
 export default function App() {
   const sdkRef = useMemo<{ current?: PrivadoExpoClient }>(() => ({}), []);
+  const circuitArtifactStore = useMemo(() => new CircuitArtifactStore(), []);
+  const circuitDownloadLockRef = useRef(false);
   const [importedCredential, setImportedCredential] = useState<unknown>();
   const [summaries, setSummaries] = useState<ImportedCredentialSummary[]>([]);
   const [holderDid, setHolderDid] = useState<HolderDidSummary>();
+  const [claimOfferMessage, setClaimOfferMessage] = useState(sampleCredentialOfferMessage);
+  const [circuitZipUrl, setCircuitZipUrl] = useState(defaultCircuitZipUrl);
+  const [circuitSummaries, setCircuitSummaries] = useState<CircuitSummary[]>([]);
+  const [circuitDownloadPhase, setCircuitDownloadPhase] = useState<CircuitDownloadPhase>("idle");
   const [status, setStatus] = useState("Ready");
 
   async function getSdk(): Promise<PrivadoExpoClient> {
@@ -91,8 +139,12 @@ export default function App() {
       },
       randomBytes: Crypto.getRandomBytes
     });
+    const sqliteDatabase = toSQLiteDatabaseLike(database);
     const recordStore = new SQLiteCredentialRecordStore({
-      database: toSQLiteDatabaseLike(database)
+      database: sqliteDatabase
+    });
+    const mobileMetadataStore = new SQLiteKeyValueStore({
+      database: sqliteDatabase
     });
     const credentialStorage = new EncryptedCredentialStorage({
       secureKeyStore,
@@ -102,20 +154,31 @@ export default function App() {
     const identityStorage = new EncryptedIdentityStorage({
       secureKeyStore
     });
-    const privateKeyStore = new SecurePrivateKeyStore({
+    const kmsAdapter = new MobileBjjKmsAdapter({
       secureKeyStore,
       randomBytes: Crypto.getRandomBytes
     });
-    const kmsAdapter = new DevelopmentOnlyKmsAdapter({
-      privateKeyStore,
-      randomBytes: Crypto.getRandomBytes
+    const witnessCalculator = new CircomWitnessNativeCalculator({
+      graphReader: createExpoWitnessGraphReader()
+    });
+    const nativeProver = new RapidsnarkNativeProver({
+      fileInspector: createExpoProverFileInspector()
+    });
+    const zkProvider = new AuthV2ZKProvider({
+      witnessCalculator,
+      prover: nativeProver
     });
 
     sdkRef.current = createPrivadoExpoClient(config, {
       secureKeyStore,
+      mobileMetadataStore,
       credentialStorage,
       identityStorage,
       kmsAdapter,
+      circuitArtifactStore,
+      zkProvider,
+      authV2WitnessCalculator: witnessCalculator,
+      authV2NativeProver: nativeProver,
       developmentHolderDidProvider: new DevelopmentOnlyHolderDidProvider()
     });
     return sdkRef.current;
@@ -127,6 +190,40 @@ export default function App() {
       setStatus(`${label}: ${formatResult(result)}`);
     } catch (error) {
       setStatus(`${label}: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+  }
+
+  async function downloadCircuits(): Promise<unknown> {
+    if (circuitDownloadLockRef.current) {
+      return "Circuit download is already running.";
+    }
+    circuitDownloadLockRef.current = true;
+    setCircuitDownloadPhase("downloading");
+    try {
+      const downloader = new CircuitArtifactDownloader({
+        zipUrl: circuitZipUrl,
+        requiredCircuits: requiredDemoCircuits,
+        fileSystem: createExpoCircuitFileSystemAdapter(),
+        zipExtractor: createReactNativeZipExtractor(),
+        artifactStore: circuitArtifactStore,
+        version: "downloaded",
+        onStatus: (phase) => setCircuitDownloadPhase(phase)
+      });
+      const result = await downloader.prepare();
+      const summaries = result.descriptors.map(toCircuitSummary);
+      setCircuitSummaries(summaries);
+      setCircuitDownloadPhase("registered");
+      return {
+        status: result.status,
+        circuits: summaries,
+        zipPath: summarizePath(result.zipPath),
+        extractDir: summarizePath(result.extractDir)
+      };
+    } catch (error) {
+      setCircuitDownloadPhase("error");
+      throw error;
+    } finally {
+      circuitDownloadLockRef.current = false;
     }
   }
 
@@ -216,9 +313,77 @@ export default function App() {
             }
           />
           <DemoButton
+            label="Download circuits"
+            disabled={isCircuitDownloadBusy(circuitDownloadPhase)}
+            onPress={() => run("Download circuits", downloadCircuits)}
+          />
+          <DemoButton
+            label="Check circuits"
+            onPress={() =>
+              run("Check circuits", async () => {
+                const results = requiredDemoCircuits.map((circuitId) => ({
+                  circuitId,
+                  validation: circuitArtifactStore.validate(circuitId, "native"),
+                  artifact: circuitArtifactStore.resolve(circuitId)
+                }));
+                const summaries = results
+                  .filter((item) => item.artifact)
+                  .map((item) => toCircuitSummary(item.artifact as CircuitArtifactDescriptor));
+                setCircuitSummaries(summaries);
+                return results.map((item) => ({
+                  circuitId: item.circuitId,
+                  valid: item.validation.valid,
+                  missing: item.validation.missing
+                }));
+              })
+            }
+          />
+          <DemoButton
+            label="Check native prover"
+            onPress={() =>
+              run("Native prover", async () => {
+                const authV2 = circuitArtifactStore.resolve(CircuitId.AuthV2);
+                const zkeyPath = authV2?.zkey?.localPath ?? authV2?.zkeyPath;
+                if (!zkeyPath) {
+                  throw new Error("AuthV2 zkeyPath is required to check native prover.");
+                }
+                const prover = new RapidsnarkNativeProver();
+                const result = await prover.checkAvailable(toNativeFilePath(zkeyPath));
+                return {
+                  available: result.available,
+                  publicBufferSize: result.publicBufferSize
+                };
+              })
+            }
+          />
+          <DemoButton
+            label="Check witness calculator"
+            onPress={() =>
+              run("Witness calculator", async () => {
+                const calculator = new CircomWitnessNativeCalculator();
+                const result = await calculator.isAvailable();
+                return {
+                  available: result.available,
+                  message: result.message
+                };
+              })
+            }
+          />
+          <TextInput
+            accessibilityLabel="Circuit ZIP URL"
+            value={circuitZipUrl}
+            onChangeText={setCircuitZipUrl}
+            style={styles.singleLineInput}
+            autoCapitalize="none"
+          />
+          <DemoButton
             label="Create/load real Holder DID"
             onPress={() =>
               run("Real Holder DID", async () => {
+                ensureCryptoGetRandomValues();
+                if (!hasSecureRandomProvider()) {
+                  throw new Error("Secure random provider is not available in this Expo runtime.");
+                }
                 const sdk = await getSdk();
                 const result = await sdk.createOrLoadHolderDid({
                   mode: "real",
@@ -286,6 +451,135 @@ export default function App() {
               })
             }
           />
+          <TextInput
+            accessibilityLabel="Credential offer message"
+            multiline
+            value={claimOfferMessage}
+            onChangeText={setClaimOfferMessage}
+            style={styles.input}
+          />
+          <DemoButton
+            label="Claim VC from offer"
+            onPress={() =>
+              run("Claim", async () => {
+                ensureCryptoGetRandomValues();
+                if (!hasSecureRandomProvider()) {
+                  throw new Error("Secure random provider is not available in this Expo runtime.");
+                }
+                const sdk = await getSdk();
+                const identity = holderDid ?? (await sdk.createOrLoadHolderDid({
+                  mode: "real",
+                  method: "iden3",
+                  network: config.network.name
+                }));
+                setHolderDid(identity);
+                const result = await sdk.claimCredentialFromOffer({
+                  message: claimOfferMessage,
+                  holderDid: identity.did
+                });
+                const list = await sdk.getCredentials();
+                setSummaries(list);
+                return result;
+              })
+            }
+          />
+          <DemoButton
+            label="Check AuthV2 inputs"
+            onPress={() =>
+              run("AuthV2 inputs", async () => {
+                const sdk = await getSdk();
+                const identity = holderDid ?? (await sdk.createOrLoadHolderDid({
+                  mode: "real",
+                  method: "iden3",
+                  network: config.network.name
+                }));
+                setHolderDid(identity);
+                const preview = await sdk.buildAuthV2InputsPreview({
+                  message: claimOfferMessage,
+                  holderDid: identity.did
+                });
+                return {
+                  status: preview.ready ? "AuthV2 inputs: native-ready" : "AuthV2 inputs: not ready",
+                  nativeReady: preview.nativeReady,
+                  fields: preview.fields.length,
+                  authClaimSlots: preview.authClaimSlots,
+                  challenge: preview.challenge,
+                  authClaimIncMtpSiblings: preview.siblingsCount,
+                  authClaimNonRevMtpSiblings: preview.nonRevSiblingsCount,
+                  gistMtpSiblings: preview.gistSiblingsCount,
+                  rootsStatePresent: preview.rootsStatePresent,
+                  signaturePresent: preview.signaturePresent
+                };
+              })
+            }
+          />
+          <DemoButton
+            label="Generate AuthV2 witness only"
+            onPress={() =>
+              run("AuthV2 witness", async () => {
+                const sdk = await getSdk();
+                const identity = holderDid ?? (await sdk.createOrLoadHolderDid({
+                  mode: "real",
+                  method: "iden3",
+                  network: config.network.name
+                }));
+                setHolderDid(identity);
+                return sdk.generateAuthV2WitnessOnly({
+                  message: claimOfferMessage,
+                  holderDid: identity.did
+                });
+              })
+            }
+          />
+          <DemoButton
+            label="Generate AuthV2 proof only"
+            onPress={() =>
+              run("AuthV2 proof", async () => {
+                const sdk = await getSdk();
+                const identity = holderDid ?? (await sdk.createOrLoadHolderDid({
+                  mode: "real",
+                  method: "iden3",
+                  network: config.network.name
+                }));
+                setHolderDid(identity);
+                return sdk.generateAuthV2ProofOnly({
+                  message: claimOfferMessage,
+                  holderDid: identity.did
+                });
+              })
+            }
+          />
+          <DemoButton
+            label="Check GIST proof"
+            onPress={() =>
+              run("GIST", async () => {
+                const sdk = await getSdk();
+                const identity = holderDid ?? (await sdk.getHolderDid());
+                if (!identity) {
+                  throw new Error("No holder identity loaded.");
+                }
+                const gistProofSource = new ReadOnlyMobileGistProofSource({
+                  didResolverUrl: config.didResolver.didResolverUrl,
+                  chainId: config.network.chainId,
+                  rpcUrl: config.network.rpcUrl,
+                  stateContractAddress: config.contracts.stateContractAddress
+                });
+                const proof = await gistProofSource.getGISTProof(identity.did, {
+                  network: identity.network,
+                  isStateGenesis: true
+                });
+                if (!proof) {
+                  throw new Error("AuthV2 GIST proof could not be generated safely.");
+                }
+                return {
+                  source: proof.source,
+                  root: proof.root,
+                  existence: proof.existence,
+                  siblings: proof.siblings.length
+                };
+              })
+            }
+          />
         </View>
 
         <Text style={styles.sectionTitle}>Status</Text>
@@ -318,14 +612,50 @@ export default function App() {
         ) : (
           <Text style={styles.status}>No holder identity loaded.</Text>
         )}
+
+        <Text style={styles.sectionTitle}>Circuit assets</Text>
+        <Text style={styles.status}>Circuit download: {circuitDownloadPhase}</Text>
+        <Text style={styles.status}>ZKProvider: AuthV2 configured with witness calculator and native prover.</Text>
+        {circuitSummaries.length > 0 ? (
+          circuitSummaries.map((summary) => (
+            <View key={summary.circuitId} style={styles.summary}>
+              <Text style={styles.summaryTitle}>{summary.circuitId}</Text>
+              <Text style={styles.summaryLine}>Version: {summary.version ?? "Unknown"}</Text>
+              <Text style={styles.summaryLine}>Graph: {summary.graphPath ?? "Missing"}</Text>
+              <Text style={styles.summaryLine}>ZKey: {summary.zkeyPath ?? "Missing"}</Text>
+              <Text style={styles.summaryLine}>Dat: {summary.datPath ?? "Optional missing"}</Text>
+            </View>
+          ))
+        ) : (
+          <Text style={styles.status}>No circuit assets registered.</Text>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
 }
 
-function DemoButton({ label, onPress }: { label: string; onPress: () => void }) {
+type CircuitSummary = {
+  circuitId: string;
+  version?: string;
+  graphPath?: string;
+  zkeyPath?: string;
+  datPath?: string;
+};
+
+type CircuitDownloadPhase =
+  | "idle"
+  | CircuitArtifactDownloadStatus
+  | "error";
+
+function DemoButton({ label, onPress, disabled = false }: { label: string; onPress: () => void; disabled?: boolean }) {
   return (
-    <Pressable accessibilityRole="button" style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]} onPress={onPress}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ disabled }}
+      disabled={disabled}
+      style={({ pressed }) => [styles.button, pressed && styles.buttonPressed, disabled && styles.buttonDisabled]}
+      onPress={onPress}
+    >
       <Text style={styles.buttonText}>{label}</Text>
     </Pressable>
   );
@@ -355,6 +685,135 @@ function summarizeSignature(value: {
     signaturePreview: `${value.signature.slice(0, 12)}...`,
     signatureLength: value.signature.length,
     developmentOnly: value.developmentOnly
+  };
+}
+
+function createExpoCircuitFileSystemAdapter(): CircuitArtifactFileSystemAdapter {
+  return {
+    cacheDirectory: FileSystem.cacheDirectory ?? undefined,
+    documentDirectory: FileSystem.documentDirectory ?? undefined,
+    exists: async (path) => (await FileSystem.getInfoAsync(path)).exists,
+    makeDirectory: async (path) => {
+      const info = await FileSystem.getInfoAsync(path);
+      if (!info.exists) {
+        await FileSystem.makeDirectoryAsync(path, { intermediates: true });
+      }
+    },
+    downloadFile: async (url, destinationPath) => {
+      const result = await FileSystem.downloadAsync(url, destinationPath);
+      return { path: result.uri };
+    },
+    deleteFile: async (path) => {
+      const info = await FileSystem.getInfoAsync(path);
+      if (info.exists) {
+        await FileSystem.deleteAsync(path, { idempotent: true });
+      }
+    }
+  };
+}
+
+function createReactNativeZipExtractor(): ZipExtractor {
+  return {
+    extract: async (zipPath, destinationDir) => {
+      await unzip(toNativeFilePath(zipPath), toNativeFilePath(destinationDir));
+    }
+  };
+}
+
+function createExpoWitnessGraphReader() {
+  return {
+    readGraphBase64: async (graphPath: string) => {
+      if (!graphPath.endsWith(".wcd")) {
+        throw new Error("AuthV2 witness graph must be a .wcd artifact.");
+      }
+      const info = await FileSystem.getInfoAsync(graphPath, { size: true });
+      if (!info.exists) {
+        throw new Error("AuthV2 witness graph file does not exist.");
+      }
+      const sizeBytes = "size" in info && typeof info.size === "number" ? info.size : undefined;
+      if (sizeBytes !== undefined && sizeBytes <= 0) {
+        throw new Error("AuthV2 witness graph file is empty.");
+      }
+      const base64 = await FileSystem.readAsStringAsync(graphPath, {
+        encoding: FileSystem.EncodingType.Base64
+      });
+      return {
+        base64,
+        sizeBytes
+      };
+    }
+  };
+}
+
+function createExpoProverFileInspector() {
+  return {
+    inspectFile: async (path: string) => {
+      const info = await FileSystem.getInfoAsync(path, { size: true });
+      return {
+        exists: info.exists,
+        sizeBytes: info.exists && "size" in info && typeof info.size === "number" ? info.size : undefined
+      };
+    }
+  };
+}
+
+function toCircuitSummary(descriptor: CircuitArtifactDescriptor): CircuitSummary {
+  return {
+    circuitId: descriptor.circuitId,
+    version: descriptor.version,
+    graphPath: summarizePath(descriptor.graph?.localPath ?? descriptor.graphPath),
+    zkeyPath: summarizePath(descriptor.zkey?.localPath ?? descriptor.zkeyPath),
+    datPath: summarizePath(descriptor.dat?.localPath ?? descriptor.datPath)
+  };
+}
+
+function summarizePath(path: string | undefined): string | undefined {
+  if (!path) {
+    return undefined;
+  }
+  const parts = path.split("/");
+  return parts.slice(Math.max(0, parts.length - 3)).join("/");
+}
+
+function summarizeError(message: string): string {
+  return message.split(/\r?\n/)[0]?.slice(0, 160) ?? "validation failed";
+}
+
+function toNativeFilePath(path: string): string {
+  return path.replace(/^file:\/\//, "");
+}
+
+function isCircuitDownloadBusy(phase: CircuitDownloadPhase): boolean {
+  return phase === "downloading" || phase === "extracting" || phase === "validating";
+}
+
+function hasSecureRandomProvider(): boolean {
+  return typeof globalThis.crypto?.getRandomValues === "function";
+}
+
+function ensureCryptoGetRandomValues(): void {
+  if (hasSecureRandomProvider()) {
+    return;
+  }
+
+  const target = globalThis as typeof globalThis & {
+    crypto?: {
+      getRandomValues?: <T extends ArrayBufferView | null>(array: T) => T;
+    };
+  };
+  target.crypto = target.crypto ?? {};
+  target.crypto.getRandomValues = <T extends ArrayBufferView | null>(array: T): T => {
+    if (!array || !ArrayBuffer.isView(array)) {
+      throw new TypeError("crypto.getRandomValues requires a typed array.");
+    }
+    const view = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+    let offset = 0;
+    while (offset < view.byteLength) {
+      const chunkLength = Math.min(65536, view.byteLength - offset);
+      view.set(Crypto.getRandomBytes(chunkLength), offset);
+      offset += chunkLength;
+    }
+    return array;
   };
 }
 
@@ -399,6 +858,9 @@ const styles = StyleSheet.create({
   buttonPressed: {
     opacity: 0.72
   },
+  buttonDisabled: {
+    opacity: 0.45
+  },
   buttonText: {
     color: "#ffffff",
     fontSize: 15,
@@ -415,6 +877,23 @@ const styles = StyleSheet.create({
     backgroundColor: "#ffffff",
     color: "#111827",
     padding: 12,
+    fontSize: 13
+  },
+  input: {
+    minHeight: 130,
+    borderRadius: 8,
+    backgroundColor: "#ffffff",
+    color: "#111827",
+    padding: 12,
+    fontSize: 13,
+    textAlignVertical: "top"
+  },
+  singleLineInput: {
+    minHeight: 44,
+    borderRadius: 8,
+    backgroundColor: "#ffffff",
+    color: "#111827",
+    paddingHorizontal: 12,
     fontSize: 13
   },
   summary: {
