@@ -1,4 +1,8 @@
 import type { CircuitId } from "../circuits/CircuitId";
+import type { AuthV2InputBuilder } from "../auth/AuthV2InputBuilder";
+import type { MobileGistProofSource } from "../auth/MobileGistProofSource";
+import type { HttpClient } from "../network/HttpClient";
+import type { NativeProver, NativeWitnessCalculator } from "../zk/AuthV2ZKProvider";
 
 export interface NetworkConfig {
   name: string;
@@ -9,12 +13,18 @@ export interface NetworkConfig {
 export interface IssuerConfig {
   issuerDid: string;
   issuerBaseUrl?: string;
+  issuerAdminBase?: string;
+  basicAuth?: {
+    username: string;
+    password: string;
+  };
 }
 
 export interface CredentialConfig {
   credentialType: string;
   credentialSchema: string;
   credentialContext: string | string[];
+  credentialExpirationDays?: number;
 }
 
 export interface VerifierConfig {
@@ -35,19 +45,57 @@ export interface DidResolverConfig {
 export interface CircuitArtifactFile {
   url?: string;
   localPath?: string;
-  sha256: string;
-  sizeBytes: number;
+  path?: string;
+  sha256?: string;
+  sizeBytes?: number;
 }
 
 export interface CircuitArtifactDescriptor {
   circuitId: CircuitId;
-  wasm: CircuitArtifactFile;
-  zkey: CircuitArtifactFile;
-  verificationKey: CircuitArtifactFile;
+  version?: string;
+  wasm?: CircuitArtifactFile;
+  graph?: CircuitArtifactFile;
+  dat?: CircuitArtifactFile;
+  zkey?: CircuitArtifactFile;
+  verificationKey?: CircuitArtifactFile;
+  wasmPath?: string;
+  graphPath?: string;
+  datPath?: string;
+  zkeyPath?: string;
+  verificationKeyPath?: string;
+  hashes?: {
+    wasm?: string;
+    graph?: string;
+    dat?: string;
+    zkey?: string;
+    verificationKey?: string;
+  };
+  sizes?: {
+    wasm?: number;
+    graph?: number;
+    dat?: number;
+    zkey?: number;
+    verificationKey?: number;
+  };
 }
 
 export interface CircuitArtifactManifest {
   artifacts: CircuitArtifactDescriptor[];
+}
+
+export type CircuitWitnessMode = "wasm" | "native";
+
+export interface CircuitArtifactValidationResult {
+  circuitId: CircuitId;
+  valid: boolean;
+  missing: string[];
+}
+
+export interface CircuitArtifactResolver {
+  register(descriptor: CircuitArtifactDescriptor): void;
+  resolve(circuitId: CircuitId): CircuitArtifactDescriptor | undefined;
+  require(circuitId: CircuitId): CircuitArtifactDescriptor;
+  validate(circuitId: CircuitId, witnessMode?: CircuitWitnessMode): CircuitArtifactValidationResult;
 }
 
 export interface PrivadoExpoConfig {
@@ -61,6 +109,7 @@ export interface PrivadoExpoConfig {
 }
 
 export interface StorageAdapter<TRecord = unknown> {
+  init?(): Promise<void>;
   get(key: string): Promise<TRecord | undefined>;
   set(key: string, value: TRecord): Promise<void>;
   remove(key: string): Promise<void>;
@@ -181,6 +230,17 @@ export interface DeleteHolderIdentityResult {
 
 export interface HolderDidProvider {
   readonly developmentOnly?: boolean;
+  createHolderIdentity?(input: {
+    keyId?: string;
+    method?: string;
+    network?: string;
+  }): Promise<{
+    did: string;
+    keyId: string;
+    method?: string;
+    network?: string;
+    developmentOnly?: boolean;
+  }>;
   createDid(input: {
     keyId: string;
     method?: string;
@@ -234,6 +294,103 @@ export interface ZkpTxSubmitter {
   submitProof(input: SubmitProofInput): Promise<{ txHash: string; raw?: unknown }>;
 }
 
+export interface SubmitOnchainProofToUniversalVerifierInput {
+  preparedProof: GeneratedProof;
+  requestId?: string | number;
+  evmPrivateKey: string;
+  rpcUrl?: string;
+  universalVerifierAddress?: string;
+  chainId?: number;
+  challengeAddress?: string;
+  validatorAddress?: string;
+}
+
+export interface UniversalVerifierCalldata {
+  method: "submitZKPResponse";
+  requestId: string;
+  inputs: string[];
+  a: [string, string];
+  b: [[string, string], [string, string]];
+  c: [string, string];
+}
+
+export interface UniversalVerifierSubmitResult {
+  txSubmitted: boolean;
+  txHash?: string;
+  receiptStatus?: number;
+  blockNumber?: number;
+  gasUsed?: string;
+  requestId: string;
+  challengeAddress?: string;
+  universalVerifierAddress: string;
+  eventName?: string;
+  verificationResult?: boolean;
+  signerAddress?: string;
+  staticCallOk?: boolean;
+  calldataDebug?: UniversalVerifierCalldataDebug;
+}
+
+export interface UniversalVerifierRequestStatus {
+  requestId: string;
+  universalVerifierAddress: string;
+  exists: boolean;
+  enabled?: boolean;
+  requestOwner?: string;
+  contractOwner?: string;
+  validator?: string;
+  metadata?: string;
+  metadataCircuitId?: string;
+  metadataQuery?: unknown;
+  dataLength?: number;
+  registeredQueryHash?: string;
+  registeredOperator?: string;
+  registeredValue?: string;
+  registeredSchema?: string;
+  registeredClaimPathKey?: string;
+  readError?: string;
+}
+
+export interface UniversalVerifierCalldataDebug {
+  requestIdUsedForProof: string;
+  requestIdUsedForSubmit: string;
+  requestIdFromPublicSignals?: string;
+  requestMatchesProof: boolean;
+  requestIdMatchesPublicSignal: boolean;
+  registeredValidator?: string;
+  registeredCircuitId?: string;
+  registeredOperator?: string;
+  registeredValue?: string;
+  registeredQueryHash?: string;
+  queryHashFromRequest?: string;
+  proofCircuitId: string;
+  proofOperator?: string;
+  proofValue?: string;
+  proofCircuitQueryHash?: string;
+  queryHashFromPublicSignal?: string;
+  queryHashMatches?: boolean;
+  challengeAddress?: string;
+  signerAddress?: string;
+  signerMatchesChallenge?: boolean;
+  proofChallenge?: string;
+  challengeFromPublicSignal?: string;
+  expectedChallenge?: string;
+  challengeMatchesExpected?: boolean;
+  challengeMatchesSigner?: boolean;
+  publicSignalsCount: number;
+  calldataProofFormat: "web-compatible";
+  piBOrder: "swapped";
+  canStaticCall: boolean;
+  staticCallError?: string;
+  failureLayer:
+    | "none"
+    | "signer-challenge-mismatch"
+    | "request-publicsignal-mismatch"
+    | "queryhash-mismatch"
+    | "calldata-format"
+    | "artifact-validator-mismatch"
+    | "cryptographic-verification";
+}
+
 export interface OnchainSubmitStrategy {
   submit(input: SubmitProofInput, submitter: ZkpTxSubmitter): Promise<{ txHash: string; raw?: unknown }>;
 }
@@ -250,11 +407,208 @@ export interface ImportedCredentialSummary {
 }
 
 export interface ClaimCredentialInput {
-  offer: string | Record<string, unknown>;
+  offer?: string | Record<string, unknown>;
+  message?: string | Record<string, unknown>;
   holderDid?: string;
 }
 
+export interface ClaimCredentialFromIssuerInput {
+  holderDid?: string;
+  offer?: string | Record<string, unknown>;
+  credentialSubject: Record<string, unknown>;
+  credentialType?: string;
+  credentialSchema?: string;
+  credentialExpirationDays?: number;
+}
+
+export type IssuerClaimDebugStepName = "createCredential" | "offer" | "claim" | "save";
+
+export interface IssuerClaimDebugStep {
+  step: IssuerClaimDebugStepName;
+  status: "ok" | "error" | "skipped" | "saved";
+  method?: string;
+  url?: string;
+  httpStatus?: number;
+  contentType?: string;
+  responsePreview?: string;
+  challengeSource?: "jwz-message-hash" | "offer-or-fallback";
+  challengeLength?: number;
+  challengeUnderField?: boolean;
+  claimLocalStep?:
+    | "build-fetch-request"
+    | "compute-jwz-challenge"
+    | "generate-authv2-proof"
+    | "pack-jwz"
+    | "post-agent"
+    | "receive-credential";
+  postExecuted?: boolean;
+  jwzHeader?: {
+    typ?: string;
+    alg?: string;
+    circuitId?: string;
+  };
+  messageId?: string;
+  messageIdFormat?: "uuid" | "invalid";
+  threadId?: string;
+  threadIdFormat?: "uuid" | "invalid";
+  messageType?: string;
+  credentialSummary?: {
+    id?: string;
+    type: string[];
+    issuer?: string;
+    proofTypes: string[];
+    credentialStatus?: {
+      type?: string;
+      url?: string;
+    };
+    mtpViable: boolean;
+    mtpUnavailableReason?: string;
+  };
+  error?: string;
+}
+
+export interface ClaimCredentialRuntimeContext {
+  input: ClaimCredentialInput;
+  message: Record<string, unknown>;
+  holderDid: HolderDidSummary;
+  keyId: string;
+  profileNonce: string;
+  authProof?: unknown;
+}
+
+export interface ClaimCredentialResult {
+  holderDid: string;
+  credentialIds: string[];
+  credentials: ImportedCredentialSummary[];
+}
+
+export interface ClaimCredentialFromIssuerResult extends ClaimCredentialResult {
+  credentialSaved: boolean;
+  credentialType?: string;
+  issuerDid?: string;
+  storageId?: string;
+}
+
+export interface ClaimCredentialFromIssuerDebugResult extends ClaimCredentialFromIssuerResult {
+  steps: IssuerClaimDebugStep[];
+}
+
+export interface AuthV2WitnessOnlyResult {
+  graphSource?: string;
+  graphExtension?: string;
+  graphExists: boolean;
+  graphSizeBytes?: number;
+  inputsKeysCount: number;
+  authClaimIncMtpSiblings: number;
+  authClaimNonRevMtpSiblings: number;
+  gistMtpSiblings: number;
+  witnessGenerated: boolean;
+  witnessEncoding?: string;
+  witnessSizeBytes?: number;
+}
+
+export interface AuthV2ProofOnlyResult extends AuthV2WitnessOnlyResult {
+  zkeyPathExists: boolean;
+  zkeySizeBytes?: number;
+  proofGenerated: boolean;
+  publicSignalsCount?: number;
+}
+
+export interface Iden3commClaimProvider {
+  claimCredentialFromOffer(input: ClaimCredentialRuntimeContext): Promise<unknown>;
+}
+
 export type ProofKind = "sig" | "mtp";
+export type CredentialProofMode = "offchain" | "onchain";
+export type CredentialProofOperator = "eq" | "lt" | "gt" | "in" | "noop";
+
+export interface CredentialProofQuery {
+  field: string;
+  operator: CredentialProofOperator;
+  value?: unknown;
+}
+
+export interface CredentialProofOnchainOptions {
+  universalVerifierAddress?: string;
+  validatorAddress?: string;
+  requestId?: string | number;
+  challengeAddress?: string;
+  evmPrivateKey?: string;
+  signer?: "external" | "injected";
+  paymaster?: string;
+}
+
+export interface GenerateCredentialProofInput {
+  credentialId: string;
+  credentialType: string;
+  issuerDid?: string;
+  schema?: string;
+  query: CredentialProofQuery;
+  circuitId?: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  mode?: CredentialProofMode;
+  onchain?: CredentialProofOnchainOptions;
+}
+
+export interface CredentialProofPlan {
+  credentialId: string;
+  credentialType: string;
+  issuerDid?: string;
+  schema?: string;
+  mode: CredentialProofMode;
+  circuitId: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  query: CredentialProofQuery;
+  request: ProofRequest;
+  credentialSummary: ImportedCredentialSummary;
+  onchain?: CredentialProofOnchainOptions;
+  proofGenerated: false;
+  nextBoundary: string;
+}
+
+export interface CredentialAtomicQuerySigV2ProofResult {
+  proofGenerated: boolean;
+  mode?: CredentialProofMode;
+  circuitId: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  credentialId: string;
+  credentialType: string;
+  issuerDid?: string;
+  field: string;
+  operator: CredentialProofOperator;
+  proofRoute?: "slot-based" | "merklized";
+  requestId?: string;
+  challengeAddress?: string;
+  challenge?: string;
+  publicSignalsCount?: number;
+  inputsKeysCount: number;
+  graphSource?: string;
+  graphExtension?: string;
+  graphExists: boolean;
+  graphSizeBytes?: number;
+  zkeyPathExists: boolean;
+  zkeySizeBytes?: number;
+  proofSource?: "rapidsnark";
+  publicSignalsSource?: "rapidsnark" | "missing";
+}
+
+export interface PreparedCredentialAtomicQuerySigV2OnChainProof {
+  summary: CredentialAtomicQuerySigV2ProofResult;
+  preparedProof: GeneratedProof;
+  debugCircuitInputs?: {
+    circuitId: CircuitId.CredentialAtomicQuerySigV2OnChain;
+    requestId?: string;
+    credentialType: string;
+    field: string;
+    operator: CredentialProofOperator;
+    value?: unknown;
+    graphPath: string;
+    zkeyPath: string;
+    inputKeys: string[];
+    challengeEncoding: "addressToUint256LE";
+    challengeSignatureValid: boolean;
+    issuerClaimSignatureValid: boolean;
+    inputBuilderFailureLayer: "none" | "challenge-signature" | "issuer-claim-signature" | "query-value-proof" | "unknown";
+    inputs: Record<string, unknown>;
+  };
+}
 
 export interface BuildProofRequestInput {
   requestId?: string;
@@ -275,6 +629,7 @@ export interface GenerateProofInput {
   holderDid?: string;
   profileNonce?: number | string;
   circuitArtifacts?: CircuitArtifactDescriptor;
+  witnessInputs?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
 
@@ -301,11 +656,13 @@ export interface UniversalVerifierPayload {
 }
 
 export interface AuthV2Provider {
-  createAuthProof(input: ClaimCredentialInput): Promise<unknown>;
+  createAuthProof(input: ClaimCredentialInput | ClaimCredentialRuntimeContext): Promise<unknown>;
 }
 
 export interface PrivadoExpoClientAdapters {
   secureKeyStore?: SecureKeyStore;
+  mobileMetadataStore?: StorageAdapter<string>;
+  circuitArtifactStore?: CircuitArtifactResolver;
   credentialStorage?: CredentialStorageAdapter;
   identityStorage?: IdentityStorageAdapter;
   kmsAdapter?: KMSAdapter;
@@ -313,7 +670,39 @@ export interface PrivadoExpoClientAdapters {
   realHolderDidProvider?: HolderDidProvider;
   developmentHolderDidProvider?: HolderDidProvider;
   zkProvider?: ZKProvider;
+  authV2WitnessCalculator?: NativeWitnessCalculator;
+  authV2NativeProver?: NativeProver;
+  authV2InputBuilder?: AuthV2InputBuilder;
+  gistProofSource?: MobileGistProofSource;
+  httpClient?: HttpClient;
   rpcAdapter?: RPCAdapter;
   txSubmitter?: ZkpTxSubmitter;
   authV2Provider?: AuthV2Provider;
+  iden3commClaimProvider?: Iden3commClaimProvider;
+  credentialAtomicQuerySigV2InputBuilder?: CredentialAtomicQuerySigV2InputBuilder;
+  credentialAtomicQuerySigV2ValueProofProvider?: CredentialAtomicQuerySigV2ValueProofProvider;
+}
+
+export interface CredentialAtomicQuerySigV2InputBuilder {
+  buildInputs(input: {
+    plan: CredentialProofPlan;
+    credential: unknown;
+    holderDid: HolderDidSummary;
+    config: PrivadoExpoConfig;
+  }): Promise<Record<string, unknown>>;
+}
+
+export interface CredentialAtomicQuerySigV2ValueProofProvider {
+  buildValueProof(input: {
+    credential: unknown;
+    credentialType: string;
+    field: string;
+    operator: CredentialProofQuery["operator"];
+    queryValue: unknown;
+  }): Promise<{
+    proof: unknown;
+    pathKey: string;
+    pathValue: string;
+    queryValues: string[];
+  }>;
 }

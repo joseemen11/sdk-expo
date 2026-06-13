@@ -3,5 +3,10 @@ node_modules/
 npm-debug.log*
 .expo/
 .expo-shared/
+example/demo-expo/.env
+example/demo-expo/.env.local
 
 example/demo-expo/node_modules/*
+docs/decisions
+docs/evidence
+docs/

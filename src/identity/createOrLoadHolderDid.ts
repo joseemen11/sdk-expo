@@ -40,12 +40,35 @@ export async function createOrLoadHolderDid(input: {
     throw new Error("Holder DID provider is required to create a holder DID.");
   }
 
+  const method = input.request?.method;
+  const network = input.request?.network;
+  if (mode === "real" && holderDidProvider.createHolderIdentity) {
+    const holder = await holderDidProvider.createHolderIdentity({
+      keyId: input.request?.keyId,
+      method,
+      network
+    });
+    const now = new Date().toISOString();
+    const summary = await input.identityStorage.saveHolderDid({
+      did: holder.did,
+      keyId: holder.keyId,
+      method: holder.method ?? method,
+      network: holder.network ?? network,
+      createdAt: now,
+      updatedAt: now,
+      developmentOnly: false
+    });
+
+    return {
+      ...summary,
+      isNew: true
+    };
+  }
+
   if (!input.kmsAdapter?.createOrLoadKey) {
     throw new Error("KMS adapter with createOrLoadKey is required to create a holder DID.");
   }
 
-  const method = input.request?.method;
-  const network = input.request?.network;
   const key = await input.kmsAdapter.createOrLoadKey({
     keyId: input.request?.keyId,
     algorithm: mode === "development" ? "development-hmac-sha256" : "BJJ"

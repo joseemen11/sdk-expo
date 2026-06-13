@@ -13,7 +13,16 @@ export function parseCredentialOffer(
     return { raw: offer, message: offer };
   }
 
-  const encodedMessage = extractEncodedMessage(offer);
+  const trimmed = offer.trim();
+  if (trimmed.startsWith("{")) {
+    const message = JSON.parse(trimmed) as unknown;
+    if (!isRecord(message)) {
+      throw new Error("Credential offer message must be a JSON object.");
+    }
+    return { raw: offer, message };
+  }
+
+  const encodedMessage = extractEncodedMessage(trimmed);
   if (!encodedMessage) {
     throw new Error("Credential offer is invalid.");
   }

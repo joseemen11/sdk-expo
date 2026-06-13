@@ -2,23 +2,27 @@
 
 ## Result
 
-Real Privado ID holder DID creation was not completed in this block.
+Real Privado ID holder DID creation now completes through the experimental mobile-safe layer.
 
-`developmentOnly: false` is not returned by the SDK unless a real provider is configured in a future integration. The current real mode returns the controlled error:
+`createOrLoadHolderDid({ mode: "real", method: "iden3", network: "amoy" })` returns a real iden3 DID and marks the result as:
 
-```txt
-Real Privado ID holder creation is not configured.
+```json
+{
+  "developmentOnly": false
+}
 ```
+
+The smoke test confirmed a DID with the shape `did:iden3:polygon:amoy:<identifier>`.
 
 ## Dependency Check
 
-Installed root dependencies:
+Initial installed root dependencies before the spike:
 
 - `@noble/ciphers`
 - `@noble/hashes`
 - `typescript`
 
-No `@0xpolygonid/js-sdk`, Privado ID identity SDK package, `IdentityWallet`, `KMS`, or `BjjProvider` was present in the installed dependencies.
+The identity spike installed `@0xpolygonid/js-sdk@1.44.0`. The experimental mobile-safe layer now uses a local identity/KMS runtime wrapper without using the package root runtime entrypoint. See `docs/evidence/unblock-polygonid-identity-kms-imports.md`.
 
 ## Prohibited Imports Check
 
@@ -32,8 +36,24 @@ No prohibited browser storage, browser wallet, prover, or public-env patterns we
 - `MobilePrivateKeyStore`
 - `MobileMerkleTreeStorage`
 - `MobileCredentialStorage`
+- `MobileIdentityStorage`
+- `MobileStateStorage`
 
-These classes are integration points. They do not pretend to create a real Privado ID identity without the verified dependency and adapters.
+These classes now complete the first real holder identity path without using browser storage, browser key stores, or the broad package root runtime entrypoint.
+
+## DID Finalization
+
+The mobile-safe runtime now performs the post-BJJ key creation steps:
+
+- obtains the BJJ public key from the KMS provider;
+- creates an auth core claim with `SchemaHash.authSchemaHash`;
+- inserts the auth claim `hi` / `hv` into the claims tree;
+- calculates the claims root and genesis identity state;
+- derives the iden3 DID for Polygon Amoy;
+- binds the temporary Merkle trees to the final DID;
+- persists holder identity metadata through the configured identity storage.
+
+The returned SDK result does not expose private key material, seed material, encryption keys, private inputs, or raw Merkle records.
 
 ## Verification
 
@@ -43,7 +63,8 @@ These classes are integration points. They do not pretend to create a real Priva
 
 The smoke test validates:
 
-- `mode: "real"` fails with the expected controlled error when no real provider is configured;
+- `mode: "real"` creates a real holder DID with `developmentOnly: false`;
+- a second real-mode call loads the same DID instead of creating a new one;
 - `mode: "development"` still creates and loads the same development-only holder DID;
 - `getHolderDid`, `signChallenge`, and `deleteHolderIdentity` continue to work in development mode.
 
@@ -57,4 +78,4 @@ The demo has separate buttons:
 - `Sign test challenge`
 - `Delete Holder Identity`
 
-The real button should show the controlled error until the real provider is wired.
+The real button should now attempt the same real holder DID creation path. The UI must still display only DID metadata and controlled errors.

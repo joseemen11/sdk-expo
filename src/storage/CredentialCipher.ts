@@ -1,5 +1,14 @@
 import { base64ToBytes, bytesToBase64, bytesToText, textToBytes } from "../network/Base64UrlCodec";
 
+type XChaCha20Poly1305 = (
+  key: Uint8Array,
+  nonce: Uint8Array,
+  associatedData?: Uint8Array
+) => {
+  encrypt(plaintext: Uint8Array): Uint8Array;
+  decrypt(ciphertext: Uint8Array): Uint8Array;
+};
+
 export interface EncryptedPayloadEnvelope {
   v: 1;
   alg: "XChaCha20-Poly1305";
@@ -15,7 +24,7 @@ export async function encryptCredentialPayload(input: {
 }): Promise<string> {
   assertKey(input.key);
   assertNonce(input.nonce);
-  const { xchacha20poly1305 } = await import("@noble/ciphers/chacha.js");
+  const xchacha20poly1305 = await loadXChaCha20Poly1305();
   const cipher = xchacha20poly1305(input.key, input.nonce, textToBytes(input.associatedData));
   const ciphertext = cipher.encrypt(textToBytes(JSON.stringify(input.credential)));
   const envelope: EncryptedPayloadEnvelope = {
@@ -39,10 +48,15 @@ export async function decryptCredentialPayload(input: {
   }
   const nonce = base64ToBytes(envelope.nonce);
   assertNonce(nonce);
-  const { xchacha20poly1305 } = await import("@noble/ciphers/chacha.js");
+  const xchacha20poly1305 = await loadXChaCha20Poly1305();
   const cipher = xchacha20poly1305(input.key, nonce, textToBytes(input.associatedData));
   const plain = cipher.decrypt(base64ToBytes(envelope.ciphertext));
   return JSON.parse(bytesToText(plain)) as unknown;
+}
+
+async function loadXChaCha20Poly1305(): Promise<XChaCha20Poly1305> {
+  const module = await import("@noble/ciphers/chacha.js");
+  return module.xchacha20poly1305;
 }
 
 function assertKey(key: Uint8Array): void {

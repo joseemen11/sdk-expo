@@ -2,30 +2,34 @@
 
 ## Decision
 
-Real Privado ID holder DID creation is not enabled in this block.
+Real Privado ID holder DID creation now completes through the experimental mobile-safe layer.
 
 The SDK now supports `createOrLoadHolderDid({ mode })`:
 
-- `mode: "real"` attempts the real Privado ID path.
+- `mode: "real"` creates or loads the real Privado ID holder identity path.
 - `mode: "development"` uses the explicit development-only provider.
 
-When the real provider is not configured, the SDK fails with:
+After DID finalization completes, the SDK returns an iden3 DID for Polygon Amoy and marks the result as:
 
-```txt
-Real Privado ID holder creation is not configured.
+```json
+{
+  "developmentOnly": false
+}
 ```
 
 ## Technical Validation
 
-The repository does not currently include `@0xpolygonid/js-sdk` or another Privado ID identity SDK package.
+At the time of the first real-mode boundary, the repository did not include `@0xpolygonid/js-sdk` or another Privado ID identity SDK package.
 
-No local import was available for:
+The later identity spike installed `@0xpolygonid/js-sdk@1.44.0` and found root exports for:
 
 - `IdentityWallet`
 - `KMS`
 - `BjjProvider`
 
-No mobile-safe implementation was available for the storage interfaces required by `IdentityWallet.createIdentity`:
+However, the same root package entrypoint also exposes browser storage and prover surfaces, and identity-only/KMS-only deep imports are not exported by package metadata.
+
+The current mobile-safe layer provides the storage interfaces required for the first holder identity creation path:
 
 - identity wallet storage;
 - credential wallet storage;
@@ -34,7 +38,7 @@ No mobile-safe implementation was available for the storage interfaces required 
 
 ## Imports Used
 
-No Privado ID SDK imports are used in this block because none are installed or locally verifiable.
+The SDK source uses a controlled mobile-safe import wrapper backed by a local identity/KMS runtime surface. It does not import the broad package root entrypoint for runtime identity creation.
 
 The SDK adds boundary classes only:
 
@@ -44,12 +48,14 @@ The SDK adds boundary classes only:
 - `MobilePrivateKeyStore`
 - `MobileMerkleTreeStorage`
 - `MobileCredentialStorage`
+- `MobileIdentityStorage`
+- `MobileStateStorage`
 
-These boundaries do not create dummy identities and do not import browser storage or prover code.
+These boundaries do not create dummy identities and do not import the broad runtime root package.
 
-## Blocker
+## Remaining Scope
 
-To produce a real `developmentOnly: false` holder DID, the next block must add and verify the exact Privado ID identity SDK dependency and wire:
+The holder DID path now wires:
 
 - `IdentityWallet.createIdentity`
 - BJJ KMS provider
@@ -57,4 +63,4 @@ To produce a real `developmentOnly: false` holder DID, the next block must add a
 - mobile Merkle tree storage
 - mobile credential wallet storage
 
-The selected imports must be checked to ensure they do not pull in browser-only storage, browser key stores, proving packages, or native prover execution.
+Claim issuance, proof generation, and on-chain submit remain outside this decision.

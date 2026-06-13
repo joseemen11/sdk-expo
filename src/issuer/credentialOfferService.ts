@@ -13,7 +13,11 @@ export class CredentialOfferService {
   }
 
   async claimCredentialFromOffer(input: ClaimCredentialInput): Promise<unknown> {
-    parseCredentialOffer(input.offer);
+    const message = input.message ?? input.offer;
+    if (!message) {
+      throw new Error("Credential offer message is required.");
+    }
+    parseCredentialOffer(message);
 
     if (!this.authV2Provider) {
       throw new Error("AuthV2 provider is required to claim a credential from offer.");

@@ -16,11 +16,24 @@ export function validatePrivadoExpoConfig(config: PrivadoExpoConfig): PrivadoExp
 
   if (config.issuer) {
     requireString(config.issuer.issuerDid, "issuer.issuerDid");
+    if (config.issuer.issuerBaseUrl !== undefined) {
+      requireString(config.issuer.issuerBaseUrl, "issuer.issuerBaseUrl");
+    }
+    if (config.issuer.issuerAdminBase !== undefined) {
+      requireString(config.issuer.issuerAdminBase, "issuer.issuerAdminBase");
+    }
+    if (config.issuer.basicAuth !== undefined) {
+      requireString(config.issuer.basicAuth.username, "issuer.basicAuth.username");
+      requireString(config.issuer.basicAuth.password, "issuer.basicAuth.password");
+    }
   }
 
   if (config.credential) {
     requireString(config.credential.credentialType, "credential.credentialType");
     requireString(config.credential.credentialSchema, "credential.credentialSchema");
+    if (config.credential.credentialExpirationDays !== undefined) {
+      requirePositiveInteger(config.credential.credentialExpirationDays, "credential.credentialExpirationDays");
+    }
     if (Array.isArray(config.credential.credentialContext)) {
       config.credential.credentialContext.forEach((context, index) =>
         requireString(context, `credential.credentialContext[${index}]`)
@@ -39,7 +52,12 @@ export function validatePrivadoExpoConfig(config: PrivadoExpoConfig): PrivadoExp
     network: { ...config.network },
     contracts: { ...config.contracts },
     didResolver: { ...config.didResolver },
-    issuer: config.issuer ? { ...config.issuer } : undefined,
+    issuer: config.issuer
+      ? {
+          ...config.issuer,
+          basicAuth: config.issuer.basicAuth ? { ...config.issuer.basicAuth } : undefined
+        }
+      : undefined,
     credential: config.credential ? { ...config.credential } : undefined,
     verifier: config.verifier ? { ...config.verifier } : undefined,
     circuits: config.circuits ? { artifacts: [...config.circuits.artifacts] } : undefined
