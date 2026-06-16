@@ -2,11 +2,14 @@ import { CircuitId } from "../circuits/CircuitId";
 import { buildCredentialSummary, isRecord } from "../credentials/diagnostics";
 import { buildOffchainSigV2Request } from "../proofRequests/buildOffchainSigV2Request";
 import { buildOnchainSigV2Request } from "../proofRequests/buildOnchainSigV2Request";
+import { buildOffchainMtpV2Request } from "../proofRequests/buildOffchainMtpV2Request";
+import { buildOnchainMtpV2Request } from "../proofRequests/buildOnchainMtpV2Request";
 import { evmAddressToChallenge, normalizeEvmAddress } from "../onchain/evmChallenge";
 import type {
   CredentialProofMode,
   CredentialProofOnchainOptions,
   CredentialProofOperator,
+  CredentialProofQuery,
   CredentialProofPlan,
   CredentialStorageAdapter,
   GenerateCredentialProofInput,
@@ -47,16 +50,17 @@ export async function prepareCredentialProofPlan(input: GenerateCredentialProofI
     }
   }
 
-  validateCredentialProofQuery(input.query, credential);
+  const normalizedQuery = normalizeCredentialProofQuery(input.query);
+  validateCredentialProofQuery(normalizedQuery, credential);
   const issuerDid = input.issuerDid ?? summary.issuer;
   const proofQuery = buildCredentialProofQuery({
     credentialType: input.credentialType,
     issuerDid,
     schema: input.schema,
     context: normalizeCredentialContext(options.config.credential?.credentialContext),
-    field: input.query.field,
-    operator: input.query.operator,
-    value: input.query.value
+    field: normalizedQuery.field,
+    operator: normalizedQuery.operator,
+    value: normalizedQuery.value
   });
   const onchain = mode === "onchain" ? normalizeOnchainOptions(input.onchain, options.config) : undefined;
   const request = buildCredentialProofRequest({
@@ -77,7 +81,7 @@ export async function prepareCredentialProofPlan(input: GenerateCredentialProofI
     schema: input.schema,
     mode,
     circuitId,
-    query: { ...input.query },
+    query: { ...normalizedQuery },
     request,
     credentialSummary: summary,
     onchain,
@@ -86,19 +90,76 @@ export async function prepareCredentialProofPlan(input: GenerateCredentialProofI
   };
 }
 
-function resolveCredentialProofCircuit(
-  mode: CredentialProofMode,
-  circuitId?: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain
-): CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain {
-  const expected =
-    mode === "onchain" ? CircuitId.CredentialAtomicQuerySigV2OnChain : CircuitId.CredentialAtomicQuerySigV2;
-  if (circuitId && circuitId !== expected) {
-    throw new Error(`Credential proof circuit ${circuitId} is not valid for ${mode} mode.`);
+function normalizeCredentialProofQuery(query: GenerateCredentialProofInput["query"]): {
+  field: string;
+  operator: CredentialProofOperator;
+  value?: unknown;
+} {
+  if ("field" in query) {
+    return { ...query };
   }
-  return circuitId ?? expected;
+  const subject = isRecord(query.credentialSubject) ? query.credentialSubject : undefined;
+  if (!subject) {
+    throw new Error("Credential proof request query must include credentialSubject.");
+  }
+  const fields = Object.entries(subject);
+  if (fields.length === 0) {
+    throw new Error("Credential proof request query must include one credentialSubject field.");
+  }
+  if (fields.length > 1) {
+    throw new Error("Credential proof request query currently supports exactly one credentialSubject condition.");
+  }
+  const [field, condition] = fields[0];
+  if (!isRecord(condition)) {
+    throw new Error(`Credential proof request query for ${field} must include an operator object.`);
+  }
+  const operators = Object.entries(condition).filter(([key]) => key.startsWith("$"));
+  if (operators.length === 0) {
+    throw new Error(`Credential proof request query for ${field} must include an operator.`);
+  }
+  if (operators.length > 1) {
+    throw new Error(`Credential proof request query for ${field} currently supports exactly one operator.`);
+  }
+  const [operator, value] = operators[0];
+  return {
+    field,
+    operator: fromProofRequestOperator(operator),
+    value
+  };
 }
 
-function validateCredentialProofQuery(query: GenerateCredentialProofInput["query"], credential: unknown): void {
+function fromProofRequestOperator(operator: string): CredentialProofOperator {
+  switch (operator) {
+    case "$eq":
+      return "eq";
+    case "$lt":
+      return "lt";
+    case "$gt":
+      return "gt";
+    case "$in":
+      return "in";
+    case "$noop":
+      return "noop";
+    default:
+      throw new Error(`Credential proof operator is not supported: ${operator}`);
+  }
+}
+
+function resolveCredentialProofCircuit(
+  mode: CredentialProofMode,
+  circuitId?: CredentialProofPlan["circuitId"]
+): CredentialProofPlan["circuitId"] {
+  const defaults: CredentialProofPlan["circuitId"][] =
+    mode === "onchain"
+      ? [CircuitId.CredentialAtomicQuerySigV2OnChain, CircuitId.CredentialAtomicQueryMTPV2OnChain]
+      : [CircuitId.CredentialAtomicQuerySigV2, CircuitId.CredentialAtomicQueryMTPV2];
+  if (circuitId && !defaults.includes(circuitId)) {
+    throw new Error(`Credential proof circuit ${circuitId} is not valid for ${mode} mode.`);
+  }
+  return circuitId ?? defaults[0];
+}
+
+function validateCredentialProofQuery(query: CredentialProofQuery, credential: unknown): void {
   if (!query.field || typeof query.field !== "string") {
     throw new Error("Credential proof query field is required.");
   }
@@ -133,17 +194,31 @@ function buildCredentialProofQuery(input: {
     ...(input.context ? { context: input.context } : {}),
     ...(input.issuerDid ? { allowedIssuers: [input.issuerDid] } : {}),
     credentialSubject: {
-      [normalizeCredentialSubjectField(input.field)]: {
-        operator: input.operator,
-        value: input.value
-      }
+      [normalizeCredentialSubjectField(input.field)]: toProofRequestOperator(input.operator, input.value)
     }
   };
 }
 
+function toProofRequestOperator(operator: CredentialProofOperator, value: unknown): Record<string, unknown> {
+  switch (operator) {
+    case "eq":
+      return { $eq: value };
+    case "lt":
+      return { $lt: value };
+    case "gt":
+      return { $gt: value };
+    case "in":
+      return { $in: value };
+    case "noop":
+      return {};
+    default:
+      throw new Error(`Credential proof operator is not supported: ${String(operator)}`);
+  }
+}
+
 function buildCredentialProofRequest(input: {
   mode: CredentialProofMode;
-  circuitId: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  circuitId: CredentialProofPlan["circuitId"];
   credentialId: string;
   credentialType: string;
   schema?: string;
@@ -158,7 +233,7 @@ function buildCredentialProofRequest(input: {
     credentialSchema: input.schema,
     verifierAddress: input.onchain?.challengeAddress,
     challenge: input.mode === "onchain" ? evmAddressToChallenge(requireChallengeAddress(input.onchain)) : undefined,
-    proofKind: "sig" as const,
+    proofKind: isMtpCircuit(input.circuitId) ? "mtp" as const : "sig" as const,
     query: input.query,
     metadata: {
       credentialId: input.credentialId,
@@ -171,7 +246,14 @@ function buildCredentialProofRequest(input: {
       paymaster: input.onchain?.paymaster
     }
   };
-  return input.mode === "onchain" ? buildOnchainSigV2Request(requestInput) : buildOffchainSigV2Request(requestInput);
+  if (input.mode === "onchain") {
+    return isMtpCircuit(input.circuitId) ? buildOnchainMtpV2Request(requestInput) : buildOnchainSigV2Request(requestInput);
+  }
+  return isMtpCircuit(input.circuitId) ? buildOffchainMtpV2Request(requestInput) : buildOffchainSigV2Request(requestInput);
+}
+
+function isMtpCircuit(circuitId: CredentialProofPlan["circuitId"]): boolean {
+  return circuitId === CircuitId.CredentialAtomicQueryMTPV2 || circuitId === CircuitId.CredentialAtomicQueryMTPV2OnChain;
 }
 
 function normalizeCredentialContext(context: string | string[] | undefined): string | undefined {

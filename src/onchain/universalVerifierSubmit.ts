@@ -77,6 +77,10 @@ interface UniversalVerifierContractLike {
 const SIG_V2_ONCHAIN_QUERY_HASH_SIGNAL_INDEX = 2;
 const SIG_V2_ONCHAIN_REQUEST_ID_SIGNAL_INDEX = 4;
 const SIG_V2_ONCHAIN_CHALLENGE_SIGNAL_INDEX = 5;
+const MTP_V2_ONCHAIN_QUERY_HASH_SIGNAL_INDEX = 2;
+const MTP_V2_ONCHAIN_REQUEST_ID_SIGNAL_INDEX = 3;
+const MTP_V2_ONCHAIN_CHALLENGE_SIGNAL_INDEX = 4;
+const SUBMIT_ZKP_RESPONSE_LEGACY_SELECTOR = "0xb68967e2";
 
 export async function submitOnchainProofToUniversalVerifier(
   input: SubmitOnchainProofToUniversalVerifierInput
@@ -318,9 +322,10 @@ async function buildUniversalVerifierCalldataDebug(input: {
   const proofQuery = extractQuerySummary(input.input.preparedProof.request.query);
   const registeredQuery = extractQuerySummary(input.requestStatus.metadataQuery);
   const proofRequestId = decimalString(input.input.preparedProof.request.id, "preparedProof.request.id");
-  const proofSignalRequestId = input.calldata.inputs[SIG_V2_ONCHAIN_REQUEST_ID_SIGNAL_INDEX];
-  const proofCircuitQueryHash = input.calldata.inputs[SIG_V2_ONCHAIN_QUERY_HASH_SIGNAL_INDEX];
-  const proofChallenge = input.calldata.inputs[SIG_V2_ONCHAIN_CHALLENGE_SIGNAL_INDEX];
+  const signalIndexes = getOnchainSignalIndexes(input.input.preparedProof.request.circuitId);
+  const proofSignalRequestId = input.calldata.inputs[signalIndexes.requestId];
+  const proofCircuitQueryHash = input.calldata.inputs[signalIndexes.queryHash];
+  const proofChallenge = input.calldata.inputs[signalIndexes.challenge];
   const expectedChallenge = input.challengeAddress ? addressToUint256LE(input.challengeAddress) : undefined;
   const signerChallenge = addressToUint256LE(input.signerAddress);
   const queryHashMatches = input.requestStatus.registeredQueryHash
@@ -363,6 +368,15 @@ async function buildUniversalVerifierCalldataDebug(input: {
     challengeMatchesExpected: expectedChallenge ? proofChallenge === expectedChallenge : undefined,
     challengeMatchesSigner: proofChallenge === signerChallenge,
     publicSignalsCount,
+    challengeMode: "senderAddressLittleEndian",
+    submitMethod: "submitZKPResponse legacy",
+    selector: SUBMIT_ZKP_RESPONSE_LEGACY_SELECTOR,
+    proofResponsesCount: 1,
+    pubSignalsLength: publicSignalsCount,
+    requestParamsChallenge: input.input.preparedProof.request.challenge === undefined
+      ? undefined
+      : String(input.input.preparedProof.request.challenge),
+    signalIndexes,
     calldataProofFormat: "web-compatible",
     piBOrder: "swapped",
     canStaticCall: false,
@@ -416,6 +430,25 @@ async function buildUniversalVerifierCalldataDebug(input: {
       })
     };
   }
+}
+
+function getOnchainSignalIndexes(circuitId: string | undefined): {
+  queryHash: number;
+  requestId: number;
+  challenge: number;
+} {
+  if (circuitId === "credentialAtomicQueryMTPV2OnChain") {
+    return {
+      queryHash: MTP_V2_ONCHAIN_QUERY_HASH_SIGNAL_INDEX,
+      requestId: MTP_V2_ONCHAIN_REQUEST_ID_SIGNAL_INDEX,
+      challenge: MTP_V2_ONCHAIN_CHALLENGE_SIGNAL_INDEX
+    };
+  }
+  return {
+    queryHash: SIG_V2_ONCHAIN_QUERY_HASH_SIGNAL_INDEX,
+    requestId: SIG_V2_ONCHAIN_REQUEST_ID_SIGNAL_INDEX,
+    challenge: SIG_V2_ONCHAIN_CHALLENGE_SIGNAL_INDEX
+  };
 }
 
 function assertCalldataDebugReady(debug: UniversalVerifierCalldataDebug): void {

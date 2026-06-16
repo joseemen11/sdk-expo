@@ -18,6 +18,11 @@ export interface IssuerConfig {
     username: string;
     password: string;
   };
+  credentialHydration?: {
+    proofPollAttempts?: number;
+    proofPollDelayMs?: number;
+    allowExistingMtpCredentialFallback?: boolean;
+  };
 }
 
 export interface CredentialConfig {
@@ -377,6 +382,17 @@ export interface UniversalVerifierCalldataDebug {
   challengeMatchesExpected?: boolean;
   challengeMatchesSigner?: boolean;
   publicSignalsCount: number;
+  challengeMode?: "senderAddressLittleEndian";
+  submitMethod?: "submitZKPResponse legacy";
+  selector?: "0xb68967e2";
+  proofResponsesCount?: number;
+  pubSignalsLength?: number;
+  requestParamsChallenge?: string;
+  signalIndexes?: {
+    queryHash: number;
+    requestId: number;
+    challenge: number;
+  };
   calldataProofFormat: "web-compatible";
   piBOrder: "swapped";
   canStaticCall: boolean;
@@ -402,6 +418,9 @@ export interface ImportedCredentialSummary {
   credentialSubjectId?: string;
   expirationDate?: string;
   proofTypes: string[];
+  issuerCredentialId?: string;
+  mtpReady?: boolean;
+  mtpStatus?: "claimed-bjj-only" | "pending-mtp-hydration" | "mtp-hydrated" | "mtp-ready";
   createdAt?: string;
   updatedAt?: string;
 }
@@ -421,7 +440,7 @@ export interface ClaimCredentialFromIssuerInput {
   credentialExpirationDays?: number;
 }
 
-export type IssuerClaimDebugStepName = "createCredential" | "offer" | "claim" | "save";
+export type IssuerClaimDebugStepName = "createCredential" | "offer" | "claim" | "hydrate" | "save";
 
 export interface IssuerClaimDebugStep {
   step: IssuerClaimDebugStepName;
@@ -464,6 +483,25 @@ export interface IssuerClaimDebugStep {
     mtpViable: boolean;
     mtpUnavailableReason?: string;
   };
+  hydration?: {
+    credentialId?: string;
+    claimedCredentialId?: string;
+    claimedProofTypes?: string[];
+    hydrated: boolean;
+    hydratedCredentialId?: string;
+    hydratedProofTypes?: string[];
+    metadataProofTypes?: string[];
+    metadataMtpOnly?: boolean;
+    attempt?: number;
+    totalAttempts?: number;
+    source?: "detail" | "list";
+    fallbackUsed?: boolean;
+    credentialSubjectId?: string;
+    issuer?: string;
+    schema?: string;
+    selectedProofType?: string;
+    reason?: string;
+  };
   error?: string;
 }
 
@@ -474,6 +512,7 @@ export interface ClaimCredentialRuntimeContext {
   keyId: string;
   profileNonce: string;
   authProof?: unknown;
+  requireStateContractGist?: boolean;
 }
 
 export interface ClaimCredentialResult {
@@ -487,9 +526,33 @@ export interface ClaimCredentialFromIssuerResult extends ClaimCredentialResult {
   credentialType?: string;
   issuerDid?: string;
   storageId?: string;
+  issuerCredentialId?: string;
+  mtpReady?: boolean;
+  mtpStatus?: "claimed-bjj-only" | "pending-mtp-hydration" | "mtp-hydrated" | "mtp-ready";
 }
 
 export interface ClaimCredentialFromIssuerDebugResult extends ClaimCredentialFromIssuerResult {
+  steps: IssuerClaimDebugStep[];
+}
+
+export interface RefetchMtpCredentialFromIssuerInput {
+  credentialId?: string;
+  storageId?: string;
+  holderDid?: string;
+  credentialType?: string;
+  credentialSchema?: string;
+  allowExistingMtpCredentialFallback?: boolean;
+}
+
+export interface RefetchMtpCredentialFromIssuerResult {
+  credentialSaved: boolean;
+  storageId?: string;
+  issuerCredentialId?: string;
+  mtpReady: boolean;
+  mtpStatus: "pending-mtp-hydration" | "mtp-hydrated" | "mtp-ready";
+  proofTypes: string[];
+  message: string;
+  summary?: ImportedCredentialSummary;
   steps: IssuerClaimDebugStep[];
 }
 
@@ -518,6 +581,29 @@ export interface Iden3commClaimProvider {
   claimCredentialFromOffer(input: ClaimCredentialRuntimeContext): Promise<unknown>;
 }
 
+export interface IssuerCredentialResolverInput {
+  issuerDid?: string;
+  credentialId?: string;
+  holderDid: string;
+  credentialType?: string;
+  credentialSchema?: string;
+  requiredProofType: string;
+  claimedCredential?: unknown;
+  allowExistingMtpCredentialFallback?: boolean;
+}
+
+export interface IssuerCredentialResolverResult {
+  credential?: unknown;
+  hydrated: boolean;
+  source?: "detail" | "list";
+  credentialId?: string;
+  proofTypes: string[];
+}
+
+export interface IssuerCredentialResolver {
+  resolveCredentialWithProof(input: IssuerCredentialResolverInput): Promise<IssuerCredentialResolverResult>;
+}
+
 export type ProofKind = "sig" | "mtp";
 export type CredentialProofMode = "offchain" | "onchain";
 export type CredentialProofOperator = "eq" | "lt" | "gt" | "in" | "noop";
@@ -526,6 +612,13 @@ export interface CredentialProofQuery {
   field: string;
   operator: CredentialProofOperator;
   value?: unknown;
+}
+
+export interface CredentialProofRequestQuery {
+  credentialSubject: Record<string, Record<string, unknown>>;
+  context?: string;
+  type?: string;
+  proofType?: string;
 }
 
 export interface CredentialProofOnchainOptions {
@@ -543,8 +636,12 @@ export interface GenerateCredentialProofInput {
   credentialType: string;
   issuerDid?: string;
   schema?: string;
-  query: CredentialProofQuery;
-  circuitId?: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  query: CredentialProofQuery | CredentialProofRequestQuery;
+  circuitId?:
+    | CircuitId.CredentialAtomicQuerySigV2
+    | CircuitId.CredentialAtomicQuerySigV2OnChain
+    | CircuitId.CredentialAtomicQueryMTPV2
+    | CircuitId.CredentialAtomicQueryMTPV2OnChain;
   mode?: CredentialProofMode;
   onchain?: CredentialProofOnchainOptions;
 }
@@ -555,7 +652,11 @@ export interface CredentialProofPlan {
   issuerDid?: string;
   schema?: string;
   mode: CredentialProofMode;
-  circuitId: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  circuitId:
+    | CircuitId.CredentialAtomicQuerySigV2
+    | CircuitId.CredentialAtomicQuerySigV2OnChain
+    | CircuitId.CredentialAtomicQueryMTPV2
+    | CircuitId.CredentialAtomicQueryMTPV2OnChain;
   query: CredentialProofQuery;
   request: ProofRequest;
   credentialSummary: ImportedCredentialSummary;
@@ -567,7 +668,11 @@ export interface CredentialProofPlan {
 export interface CredentialAtomicQuerySigV2ProofResult {
   proofGenerated: boolean;
   mode?: CredentialProofMode;
-  circuitId: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain;
+  circuitId:
+    | CircuitId.CredentialAtomicQuerySigV2
+    | CircuitId.CredentialAtomicQuerySigV2OnChain
+    | CircuitId.CredentialAtomicQueryMTPV2
+    | CircuitId.CredentialAtomicQueryMTPV2OnChain;
   credentialId: string;
   credentialType: string;
   issuerDid?: string;
@@ -592,16 +697,36 @@ export interface CredentialAtomicQuerySigV2ProofResult {
 export interface PreparedCredentialAtomicQuerySigV2OnChainProof {
   summary: CredentialAtomicQuerySigV2ProofResult;
   preparedProof: GeneratedProof;
+  debugProverOutputs?: {
+    runId?: string;
+    startedAt?: string;
+    finishedAt?: string;
+    zkeyPath?: string;
+    witnessSource?: "base64" | "file" | "unknown";
+    witnessPath?: string;
+    witnessByteLength?: number;
+    witnessSha256?: string;
+    inputByteLength?: number;
+    inputSha256?: string;
+    rawProof?: string;
+    rawPublicSignals?: string;
+    proofSnarkjs: unknown;
+    publicSignals: unknown;
+    proofCalldata?: unknown;
+    proofCalldataError?: string;
+  };
   debugCircuitInputs?: {
-    circuitId: CircuitId.CredentialAtomicQuerySigV2OnChain;
+    circuitId: CircuitId.CredentialAtomicQuerySigV2OnChain | CircuitId.CredentialAtomicQueryMTPV2OnChain;
     requestId?: string;
     credentialType: string;
     field: string;
     operator: CredentialProofOperator;
     value?: unknown;
     graphPath: string;
+    datPath?: string;
     zkeyPath: string;
     inputKeys: string[];
+    inputSha256?: string;
     challengeEncoding: "addressToUint256LE";
     challengeSignatureValid: boolean;
     issuerClaimSignatureValid: boolean;
@@ -679,6 +804,7 @@ export interface PrivadoExpoClientAdapters {
   txSubmitter?: ZkpTxSubmitter;
   authV2Provider?: AuthV2Provider;
   iden3commClaimProvider?: Iden3commClaimProvider;
+  issuerCredentialResolver?: IssuerCredentialResolver;
   credentialAtomicQuerySigV2InputBuilder?: CredentialAtomicQuerySigV2InputBuilder;
   credentialAtomicQuerySigV2ValueProofProvider?: CredentialAtomicQuerySigV2ValueProofProvider;
 }

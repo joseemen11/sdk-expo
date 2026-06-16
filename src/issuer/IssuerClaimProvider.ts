@@ -5,6 +5,9 @@ import type {
   Iden3commClaimProvider,
   IssuerClaimDebugStep,
   IssuerClaimDebugStepName,
+  IssuerCredentialResolver,
+  IssuerCredentialResolverInput,
+  IssuerCredentialResolverResult,
   PrivadoExpoConfig
 } from "../types";
 
@@ -14,6 +17,8 @@ const FETCH_REQUEST_TYPE = "https://iden3-communication.io/credentials/1.0/fetch
 const ISSUANCE_RESPONSE_TYPE = "https://iden3-communication.io/credentials/1.0/issuance-response";
 const FIELD_MODULUS = BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DEFAULT_MTP_HYDRATION_ATTEMPTS = 10;
+const DEFAULT_MTP_HYDRATION_DELAY_MS = 3000;
 
 export interface IssuerClaimProviderOptions {
   config: PrivadoExpoConfig;
@@ -50,7 +55,7 @@ export interface PreparedIssuerClaimRequest {
   };
 }
 
-export class IssuerClaimProvider implements Iden3commClaimProvider {
+export class IssuerClaimProvider implements Iden3commClaimProvider, IssuerCredentialResolver {
   private readonly config: PrivadoExpoConfig;
   private readonly fetchFn?: typeof fetch;
   private readonly now: () => number;
@@ -244,6 +249,104 @@ export class IssuerClaimProvider implements Iden3commClaimProvider {
     return { credentials: claimed };
   }
 
+  async resolveCredentialWithProof(input: IssuerCredentialResolverInput): Promise<IssuerCredentialResolverResult> {
+    const issuer = requireIssuerAdminConfig(this.config);
+    const issuerDid = input.issuerDid ?? issuer.issuerDid;
+    const requiredProofType = input.requiredProofType;
+    const hydration = this.config.issuer?.credentialHydration;
+    const attempts = Math.max(1, hydration?.proofPollAttempts ?? DEFAULT_MTP_HYDRATION_ATTEMPTS);
+    const delayMs = Math.max(0, hydration?.proofPollDelayMs ?? DEFAULT_MTP_HYDRATION_DELAY_MS);
+    let lastProofTypes: string[] = [];
+    if (input.credentialId) {
+      const detailUrl = `${trimRightSlash(issuer.adminBase)}/v2/identities/${encodeURIComponent(
+        issuerDid
+      )}/credentials/${encodeURIComponent(input.credentialId)}`;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const detail = await this.requestJson<unknown>({
+          url: detailUrl,
+          method: "GET",
+          headers: this.adminHeaders(issuer)
+        }, "hydrate");
+        const metadataProofTypes = extractMetadataProofTypes(detail);
+        const credential = extractCredentialFromIssuerAdminResponse(detail);
+        const proofTypes = extractProofTypesFromCredential(credential);
+        lastProofTypes = proofTypes.length > 0 ? proofTypes : metadataProofTypes;
+        const matches = credential ? credentialsMatchForHydration(input.claimedCredential, credential, input) : false;
+        const ready = credential && proofTypes.includes(requiredProofType) && matches;
+        this.onDebug?.({
+          step: "hydrate",
+          status: ready ? "ok" : "skipped",
+          hydration: buildHydrationSummary(input, credential, Boolean(ready), {
+            credentialId: input.credentialId,
+            metadataProofTypes,
+            attempt,
+            totalAttempts: attempts,
+            source: "detail",
+            reason: ready
+              ? undefined
+              : hydrationReason(proofTypes, metadataProofTypes, requiredProofType, matches)
+          })
+        });
+        if (ready) {
+          return {
+            credential,
+            hydrated: true,
+            source: "detail",
+            credentialId: input.credentialId,
+            proofTypes
+          };
+        }
+        if (attempt < attempts && delayMs > 0) {
+          await sleep(delayMs);
+        }
+      }
+    }
+
+    const allowExistingFallback = input.allowExistingMtpCredentialFallback ?? hydration?.allowExistingMtpCredentialFallback ?? false;
+    if (!allowExistingFallback) {
+      return {
+        hydrated: false,
+        credentialId: input.credentialId,
+        proofTypes: lastProofTypes
+      };
+    }
+
+    const listUrl = buildCredentialListUrl({
+      adminBase: issuer.adminBase,
+      issuerDid,
+      holderDid: input.holderDid,
+      credentialType: input.credentialType,
+      birthDate: extractCredentialSubjectField(input.claimedCredential, "birthDate")
+    });
+    const list = await this.requestJson<unknown>({
+      url: listUrl,
+      method: "GET",
+      headers: this.adminHeaders(issuer)
+    }, "hydrate");
+    const candidates = extractCredentialsFromIssuerAdminList(list);
+    const credential = candidates.find((candidate) =>
+      hasProofType(candidate, requiredProofType) &&
+      credentialsMatchForHydration(input.claimedCredential, candidate, input)
+    );
+    this.onDebug?.({
+      step: "hydrate",
+      status: credential ? "ok" : "skipped",
+      hydration: buildHydrationSummary(input, credential, Boolean(credential), {
+        credentialId: input.credentialId,
+        source: "list",
+        fallbackUsed: true,
+        reason: credential ? undefined : `No existing credential with ${requiredProofType} was found.`
+      })
+    });
+    return {
+      credential,
+      hydrated: Boolean(credential),
+      source: credential ? "list" : undefined,
+      credentialId: credential ? extractCredentialIdFromCredential(credential) : input.credentialId,
+      proofTypes: credential ? extractProofTypesFromCredential(credential) : []
+    };
+  }
+
   private adminHeaders(issuer: RequiredIssuerAdminConfig): Record<string, string> {
     return {
       Authorization: toBasicAuth(issuer.username, issuer.password),
@@ -282,7 +385,7 @@ export class IssuerClaimProvider implements Iden3commClaimProvider {
       httpStatus: response.status,
       contentType: readHeader(response, "content-type"),
       responsePreview:
-        response.ok && step === "claim" && input.method === "POST"
+        response.ok && ((step === "claim" && input.method === "POST") || step === "hydrate")
           ? "credential response received"
           : truncate(text, 300)
     };
@@ -508,6 +611,234 @@ function summarizeCredentialStatus(value: unknown): NonNullable<IssuerClaimDebug
     type: typeof first.type === "string" ? first.type : undefined,
     url: typeof first.id === "string" ? sanitizeUrlWithoutQuery(first.id) : undefined
   };
+}
+
+function extractCredentialFromIssuerAdminResponse(value: unknown): unknown | undefined {
+  if (isCredentialObject(value)) {
+    return value;
+  }
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const candidates = [
+    value.credential,
+    value.vc,
+    value.verifiableCredential,
+    value.data,
+    value.item,
+    value.result
+  ];
+  for (const candidate of candidates) {
+    const credential = extractCredentialFromIssuerAdminResponse(candidate);
+    if (credential) {
+      return credential;
+    }
+  }
+  return undefined;
+}
+
+function extractCredentialsFromIssuerAdminList(value: unknown): unknown[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => {
+      const credential = extractCredentialFromIssuerAdminResponse(entry);
+      return credential ? [credential] : [];
+    });
+  }
+  if (!isRecord(value)) {
+    return [];
+  }
+  const candidates = [
+    value.credentials,
+    value.items,
+    value.data,
+    value.results,
+    value.docs
+  ];
+  for (const candidate of candidates) {
+    const credentials = extractCredentialsFromIssuerAdminList(candidate);
+    if (credentials.length > 0) {
+      return credentials;
+    }
+  }
+  const single = extractCredentialFromIssuerAdminResponse(value);
+  return single ? [single] : [];
+}
+
+function isCredentialObject(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    Boolean(value.credentialSubject) &&
+    (Boolean(value.proof) || Boolean(value.credentialStatus));
+}
+
+function hasProofType(credential: unknown, proofType: string): boolean {
+  return extractProofTypesFromCredential(credential).includes(proofType);
+}
+
+function extractProofTypesFromCredential(credential: unknown): string[] {
+  return isRecord(credential) ? extractProofTypes(credential.proof) : [];
+}
+
+function extractCredentialIdFromCredential(credential: unknown): string | undefined {
+  return isRecord(credential) && typeof credential.id === "string" ? credential.id : undefined;
+}
+
+function credentialsMatchForHydration(
+  claimedCredential: unknown,
+  candidate: unknown,
+  input: IssuerCredentialResolverInput
+): boolean {
+  const claimedSubjectId = extractCredentialSubjectId(claimedCredential);
+  const candidateSubjectId = extractCredentialSubjectId(candidate);
+  if (!sameWhenBothPresent(candidateSubjectId, claimedSubjectId ?? input.holderDid)) {
+    return false;
+  }
+  if (!sameWhenBothPresent(extractIssuer(candidate), extractIssuer(claimedCredential) ?? input.issuerDid)) {
+    return false;
+  }
+  if (!sameWhenBothPresent(extractCredentialType(candidate), extractCredentialType(claimedCredential) ?? input.credentialType)) {
+    return false;
+  }
+  if (!sameWhenBothPresent(extractCredentialSchema(candidate), extractCredentialSchema(claimedCredential) ?? input.credentialSchema)) {
+    return false;
+  }
+  const claimedBirthDate = extractCredentialSubjectField(claimedCredential, "birthDate");
+  const candidateBirthDate = extractCredentialSubjectField(candidate, "birthDate");
+  if (!sameWhenBothPresent(candidateBirthDate, claimedBirthDate)) {
+    return false;
+  }
+  return true;
+}
+
+function buildCredentialListUrl(input: {
+  adminBase: string;
+  issuerDid: string;
+  holderDid: string;
+  credentialType?: string;
+  birthDate?: string;
+}): string {
+  const params = new URLSearchParams();
+  params.set("credentialSubject", input.holderDid);
+  if (input.credentialType) {
+    params.set("schemaType", input.credentialType);
+  }
+  if (input.birthDate) {
+    params.set("birthDate", input.birthDate);
+  }
+  params.set("revoked", "false");
+  params.set("status", "all");
+  params.set("sort", "-createdAt");
+  return `${trimRightSlash(input.adminBase)}/v2/identities/${encodeURIComponent(input.issuerDid)}/credentials?${params.toString()}`;
+}
+
+function buildHydrationSummary(
+  input: IssuerCredentialResolverInput,
+  credential: unknown,
+  hydrated: boolean,
+  options: {
+    credentialId?: string;
+    metadataProofTypes?: string[];
+    attempt?: number;
+    totalAttempts?: number;
+    source?: "detail" | "list";
+    fallbackUsed?: boolean;
+    reason?: string;
+  } = {}
+): NonNullable<IssuerClaimDebugStep["hydration"]> {
+  const hydratedProofTypes = extractProofTypesFromCredential(credential);
+  const metadataProofTypes = options.metadataProofTypes ?? [];
+  return {
+    credentialId: options.credentialId,
+    claimedCredentialId: extractCredentialIdFromCredential(input.claimedCredential),
+    claimedProofTypes: extractProofTypesFromCredential(input.claimedCredential),
+    hydrated,
+    hydratedCredentialId: extractCredentialIdFromCredential(credential),
+    hydratedProofTypes,
+    metadataProofTypes,
+    metadataMtpOnly: metadataProofTypes.includes(input.requiredProofType) && !hydratedProofTypes.includes(input.requiredProofType),
+    attempt: options.attempt,
+    totalAttempts: options.totalAttempts,
+    source: options.source,
+    fallbackUsed: options.fallbackUsed,
+    credentialSubjectId: extractCredentialSubjectId(credential) ?? extractCredentialSubjectId(input.claimedCredential),
+    issuer: extractIssuer(credential) ?? extractIssuer(input.claimedCredential) ?? input.issuerDid,
+    schema: extractCredentialSchema(credential) ?? extractCredentialSchema(input.claimedCredential) ?? input.credentialSchema,
+    selectedProofType: hydrated ? input.requiredProofType : undefined,
+    reason: options.reason
+  };
+}
+
+function extractMetadataProofTypes(value: unknown): string[] {
+  if (!isRecord(value)) {
+    return [];
+  }
+  const direct = value.proofTypes ?? value.proof_types ?? value.credentialProofTypes;
+  if (Array.isArray(direct)) {
+    return direct.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+  }
+  if (typeof direct === "string") {
+    return [direct];
+  }
+  const nested = [value.data, value.result, value.item].flatMap((entry) => extractMetadataProofTypes(entry));
+  return [...new Set(nested)];
+}
+
+function hydrationReason(
+  proofTypes: string[],
+  metadataProofTypes: string[],
+  requiredProofType: string,
+  matches: boolean
+): string {
+  if (!matches) {
+    return "Hydrated credential did not match claimed credential metadata.";
+  }
+  if (metadataProofTypes.includes(requiredProofType) && !proofTypes.includes(requiredProofType)) {
+    return `Issuer metadata advertises ${requiredProofType}, but vc.proof[] does not contain it yet.`;
+  }
+  return `Credential proofTypes from vc.proof[]: ${proofTypes.length > 0 ? proofTypes.join(", ") : "none"}.`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractCredentialType(credential: unknown): string | undefined {
+  if (!isRecord(credential)) {
+    return undefined;
+  }
+  const types = Array.isArray(credential.type) ? credential.type : [credential.type];
+  return [...types].reverse().find((type): type is string => typeof type === "string" && type !== "VerifiableCredential");
+}
+
+function extractCredentialSchema(credential: unknown): string | undefined {
+  if (!isRecord(credential)) {
+    return undefined;
+  }
+  const schema = credential.credentialSchema;
+  if (typeof schema === "string") {
+    return schema;
+  }
+  return isRecord(schema) && typeof schema.id === "string" ? schema.id : undefined;
+}
+
+function extractCredentialSubjectId(credential: unknown): string | undefined {
+  const subject = isRecord(credential) ? credential.credentialSubject : undefined;
+  if (Array.isArray(subject)) {
+    const first = subject.find(isRecord);
+    return typeof first?.id === "string" ? first.id : undefined;
+  }
+  return isRecord(subject) && typeof subject.id === "string" ? subject.id : undefined;
+}
+
+function extractCredentialSubjectField(credential: unknown, field: string): string | undefined {
+  const subject = isRecord(credential) ? credential.credentialSubject : undefined;
+  const source = Array.isArray(subject) ? subject.find(isRecord) : subject;
+  const value = isRecord(source) ? source[field] : undefined;
+  return value === undefined || value === null ? undefined : String(value);
+}
+
+function sameWhenBothPresent(left?: string, right?: string): boolean {
+  return !left || !right || left === right;
 }
 
 function parseIden3commMessage(text: string): Record<string, unknown> {

@@ -168,8 +168,24 @@ async function main() {
   });
   assert(credentialProofPlan.proofGenerated === false, "expected credential proof plan not to generate proof yet");
   assert(credentialProofPlan.circuitId === CircuitId.CredentialAtomicQuerySigV2, "expected offchain credential proof to use SigV2 circuit");
-  assert(credentialProofPlan.request.query.credentialSubject.age.operator === "gt", "expected configurable field/operator query");
+  assert(credentialProofPlan.request.query.credentialSubject.age.$gt === 18, "expected configurable field/operator query");
   assert(credentialProofPlan.nextBoundary.includes("credentialAtomicQuerySigV2"), "expected SigV2 builder boundary");
+  const credentialProofRequestPlan = await sdk.generateCredentialProof({
+    credentialId: "urn:test",
+    credentialType: "Demo",
+    issuerDid: "did:iden3:test",
+    query: {
+      credentialSubject: {
+        age: {
+          $eq: 21
+        }
+      }
+    },
+    mode: "offchain"
+  });
+  assert(credentialProofRequestPlan.query.field === "age", "expected proof request query field to normalize");
+  assert(credentialProofRequestPlan.query.operator === "eq", "expected proof request query operator to normalize");
+  assert(credentialProofRequestPlan.request.query.credentialSubject.age.$eq === 21, "expected proof request query shape to be preserved");
   const credentialProofPlanJson = JSON.stringify(credentialProofPlan);
   assert(!credentialProofPlanJson.includes("\"age\":21"), "credential proof plan must not expose full VC claim value");
   assert(!credentialProofPlanJson.includes("coreClaim"), "credential proof plan must not expose full proof payload");
@@ -1013,6 +1029,11 @@ async function main() {
       basicAuth: {
         username: "user",
         password: "pass"
+      },
+      credentialHydration: {
+        proofPollAttempts: 3,
+        proofPollDelayMs: 0,
+        allowExistingMtpCredentialFallback: true
       }
     },
     credential: {
@@ -1057,6 +1078,8 @@ async function main() {
   assert(issuerFetch.createdCredential === true, "expected issuer provider to create credential through Admin API");
   assert(issuerFetch.requestedOffer === true, "expected issuer provider to request raw offer");
   assert(issuerFetch.claimedCredential === true, "expected issuer provider to POST fetch request to agent");
+  assert(issuerFetch.hydratedCredential === true, "expected issuer provider to hydrate credential with MTP proof before save");
+  assert(issuerClaim.credentials[0].proofTypes.includes("Iden3SparseMerkleTreeProof"), "expected issuer claim summary to include hydrated MTP proof type");
   assert(issuerZkProvider.lastChallenge && issuerZkProvider.lastChallenge !== "12345678901234567890", "expected issuer claim to use JWZ message hash challenge");
   assert(!JSON.stringify(issuerClaim).includes("Smoke Holder"), "issuer claim result must not expose full VC subject");
   assert(!JSON.stringify(issuerClaim).includes("pass"), "issuer claim result must not expose Basic Auth secret");
@@ -1100,12 +1123,58 @@ async function main() {
   assert(receivedCredentialStep.credentialSummary.mtpUnavailableReason === "Issuer returned only BJJSignature2021; MTP unavailable.", "expected MTP unavailable reason");
   assert(receivedCredentialStep.credentialSummary.credentialStatus.type === "Iden3commRevocationStatusV1.0", "expected credentialStatus type summary");
   assert(!receivedCredentialStep.credentialSummary.credentialStatus.url.includes("?"), "credentialStatus debug URL must not include query");
+  assert(debugResult.steps.some((step) => step.step === "hydrate" && step.status === "ok" && step.hydration?.hydratedProofTypes?.includes("Iden3SparseMerkleTreeProof")), "expected debug hydration to report MTP proof type");
   assert(debugResult.steps.some((step) => step.step === "save" && step.status === "saved"), "expected debug save saved step");
   const debugJson = JSON.stringify(debugResult);
   assert(!debugJson.includes("Basic "), "issuer debug must not expose Authorization header");
   assert(!debugJson.includes("smoke-fetch-request-debug."), "issuer debug must not expose JWZ token");
   assert(!debugJson.includes("authv2-fetch-"), "issuer debug must not use timestamp fetch-request ids");
   assert(!debugJson.includes("Smoke Holder"), "issuer debug must not expose full VC subject");
+  const delayedHydrationFetch = new SmokeIssuerFetch(realHolder.did, "delayed-mtp");
+  const delayedHydrationSteps = [];
+  const delayedHydrationProvider = new IssuerClaimProvider({
+    config: {
+      ...issuerConfig,
+      issuer: {
+        ...issuerConfig.issuer,
+        credentialHydration: {
+          proofPollAttempts: 3,
+          proofPollDelayMs: 0,
+          allowExistingMtpCredentialFallback: false
+        }
+      }
+    },
+    fetchFn: delayedHydrationFetch.fetch.bind(delayedHydrationFetch),
+    onDebug: (step) => delayedHydrationSteps.push(step)
+  });
+  const delayedHydration = await delayedHydrationProvider.resolveCredentialWithProof({
+    issuerDid: issuerConfig.issuer.issuerDid,
+    credentialId: "issuer-credential-id",
+    holderDid: realHolder.did,
+    credentialType: "PersonCredential",
+    credentialSchema: "https://schema.example/person.json",
+    requiredProofType: "Iden3SparseMerkleTreeProof",
+    claimedCredential: delayedHydrationFetch.credential(false)
+  });
+  assert(delayedHydration.hydrated === true, "expected hydration polling to resolve MTP proof");
+  assert(delayedHydrationFetch.hydrationDetailRequests === 2, "expected hydration polling to retry detail endpoint");
+  assert(delayedHydrationSteps.some((step) => step.step === "hydrate" && step.hydration?.attempt === 1 && step.hydration?.reason?.includes("vc.proof[]")), "expected hydration debug to report missing real MTP proof");
+  const fallbackHydrationFetch = new SmokeIssuerFetch(realHolder.did, "detail-no-mtp");
+  const fallbackHydrationProvider = new IssuerClaimProvider({
+    config: issuerConfig,
+    fetchFn: fallbackHydrationFetch.fetch.bind(fallbackHydrationFetch)
+  });
+  const fallbackHydration = await fallbackHydrationProvider.resolveCredentialWithProof({
+    issuerDid: issuerConfig.issuer.issuerDid,
+    credentialId: "issuer-credential-id",
+    holderDid: realHolder.did,
+    credentialType: "PersonCredential",
+    credentialSchema: "https://schema.example/person.json",
+    requiredProofType: "Iden3SparseMerkleTreeProof",
+    claimedCredential: fallbackHydrationFetch.credential(false)
+  });
+  assert(fallbackHydration.hydrated === true && fallbackHydration.source === "list", "expected dev fallback list to resolve existing MTP credential");
+  assert(fallbackHydrationFetch.hydrationListRequests === 1, "expected fallback to query credential list once");
   const localChallengeSteps = [];
   const localChallengeProvider = new IssuerClaimProvider({
     config: issuerConfig,
@@ -1899,7 +1968,25 @@ function authV2GenerateProofInput(circuitArtifacts, witnessInputs) {
 
 class SmokeAuthV2InputBuilder extends AuthV2InputBuilder {
   async build(input) {
-    return completeAuthV2WitnessInputs(input?.request?.challenge ?? "123");
+    const witnessInputs = completeAuthV2WitnessInputs(input?.request?.challenge ?? "123");
+    if (input?.runtime?.requireStateContractGist) {
+      const { Hash, Proof, rootFromProof } = require("@iden3/js-merkletree");
+      const siblings = Array.from({ length: 64 }, () => Hash.fromBigInt(0n));
+      const proof = new Proof({ existence: false, siblings });
+      const root = await rootFromProof(proof, BigInt(witnessInputs.genesisID), BigInt(witnessInputs.state));
+      witnessInputs.gistRoot = root.bigInt().toString();
+      witnessInputs.gistMtp = {
+        source: "state-contract",
+        existence: false,
+        siblings: siblings.map((sibling) => sibling.bigInt().toString()),
+        index: witnessInputs.genesisID,
+        value: witnessInputs.state,
+        auxExistence: false,
+        auxIndex: "0",
+        auxValue: "0"
+      };
+    }
+    return witnessInputs;
   }
 }
 
@@ -2130,6 +2217,9 @@ class SmokeIssuerFetch {
     this.createdCredential = false;
     this.requestedOffer = false;
     this.claimedCredential = false;
+    this.hydratedCredential = false;
+    this.hydrationDetailRequests = 0;
+    this.hydrationListRequests = 0;
   }
 
   async fetch(url, init = {}) {
@@ -2170,6 +2260,34 @@ class SmokeIssuerFetch {
       });
     }
 
+    if (url === "https://issuer.example/v2/identities/did%3Aiden3%3Apolygon%3Aamoy%3Aissuer/credentials/issuer-credential-id") {
+      this.hydratedCredential = true;
+      this.hydrationDetailRequests += 1;
+      assert(init.method === "GET", "expected issuer hydration detail request to use GET");
+      assert(init.headers.Authorization === `Basic ${Buffer.from("user:pass").toString("base64")}`, "expected issuer hydration Basic Auth header");
+      const includeMtp = this.mode === "detail-no-mtp"
+        ? false
+        : this.mode === "delayed-mtp"
+          ? this.hydrationDetailRequests >= 2
+          : true;
+      return responseJson({
+        proofTypes: ["BJJSignature2021", "Iden3SparseMerkleTreeProof"],
+        credential: this.credential(includeMtp)
+      });
+    }
+
+    if (url.startsWith("https://issuer.example/v2/identities/did%3Aiden3%3Apolygon%3Aamoy%3Aissuer/credentials?")) {
+      this.hydratedCredential = true;
+      this.hydrationListRequests += 1;
+      assert(init.method === "GET", "expected issuer hydration list request to use GET");
+      assert(url.includes("schemaType=PersonCredential"), "expected hydration list to filter by credential type");
+      assert(url.includes("birthDate=946684800"), "expected hydration list to filter by credential birthDate");
+      assert(url.includes("revoked=false"), "expected hydration list to request non-revoked credentials");
+      assert(url.includes("status=all"), "expected hydration list to include all statuses");
+      assert(url.includes("sort=-createdAt"), "expected hydration list to sort by creation date");
+      return responseJson({ credentials: [this.credential(true)] });
+    }
+
     if (url === "https://issuer.example/v2/agent") {
       this.claimedCredential = true;
       if (this.mode === "claim-400") {
@@ -2189,38 +2307,61 @@ class SmokeIssuerFetch {
       assert(decodedToken.payload.from === this.holderDid, "expected JWZ payload from holder DID");
       assert(decodedToken.payload.body.id === "issuer-credential-id", "expected JWZ payload credential id");
       assert(!("challenge" in decodedToken.payload.body), "JWZ fetch-request payload must not embed proof challenge");
-      const credential = {
-        "@context": ["https://www.w3.org/2018/credentials/v1", "https://context.example/person.json"],
-        id: "urn:uuid:issuer-smoke-credential",
-        type: ["VerifiableCredential", "PersonCredential"],
-        issuer: "did:iden3:polygon:amoy:issuer",
-        issuanceDate: "2026-01-01T00:00:00.000Z",
-        credentialSubject: {
-          id: this.holderDid,
-          fullName: "Smoke Holder",
-          nationalIdNumber: "12345678",
-          birthDate: 946684800
-        },
-        credentialStatus: {
-          id: "https://issuer.example/status?id=secret",
-          type: "Iden3commRevocationStatusV1.0",
-          revocationNonce: 1
-        },
-        proof: {
-          type: "BJJSignature2021"
-        }
-      };
       return responseJson({
         id: "issuer-response",
         typ: "application/iden3comm-plain-json",
         type: "https://iden3-communication.io/credentials/1.0/issuance-response",
         body: {
-          credential: this.mode === "invalid-credential" ? { id: "invalid" } : credential
+          credential: this.mode === "invalid-credential" ? { id: "invalid" } : this.credential(false)
         }
       });
     }
 
     throw new Error(`unexpected issuer URL ${url}`);
+  }
+
+  credential(includeMtp) {
+    return {
+      "@context": ["https://www.w3.org/2018/credentials/v1", "https://context.example/person.json"],
+      id: "urn:uuid:issuer-smoke-credential",
+      type: ["VerifiableCredential", "PersonCredential"],
+      issuer: "did:iden3:polygon:amoy:issuer",
+      issuanceDate: "2026-01-01T00:00:00.000Z",
+      credentialSchema: {
+        id: "https://schema.example/person.json",
+        type: "JsonSchema2023"
+      },
+      credentialSubject: {
+        id: this.holderDid,
+        fullName: "Smoke Holder",
+        nationalIdNumber: "12345678",
+        birthDate: 946684800
+      },
+      credentialStatus: {
+        id: "https://issuer.example/status?id=secret",
+        type: "Iden3commRevocationStatusV1.0",
+        revocationNonce: 1
+      },
+      proof: includeMtp
+        ? [
+            { type: "BJJSignature2021" },
+            {
+              type: "Iden3SparseMerkleTreeProof",
+              issuerData: {
+                state: {
+                  value: "1",
+                  claimsTreeRoot: "2",
+                  revocationTreeRoot: "3",
+                  rootOfRoots: "4"
+                }
+              },
+              mtp: { existence: true, siblings: [] }
+            }
+          ]
+        : {
+            type: "BJJSignature2021"
+          }
+    };
   }
 }
 

@@ -10,3 +10,4 @@ example/demo-expo/node_modules/*
 docs/decisions
 docs/evidence
 docs/
+debug/

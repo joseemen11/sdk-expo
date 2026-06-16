@@ -12,7 +12,16 @@ export function selectMtpProofCredential<TCredential>(credential: TCredential): 
   const mtpProof = proofs.find((candidate) => isRecord(candidate) && candidate.type === MTP_PROOF_TYPE);
 
   if (!mtpProof) {
-    throw new Error("Credential does not contain an MTP proof.");
+    const proofTypes = proofs
+      .filter(isRecord)
+      .map((candidate) => candidate.type)
+      .flatMap((type) => Array.isArray(type) ? type : [type])
+      .filter((type): type is string => typeof type === "string" && type.length > 0);
+    throw new Error(
+      `No MTP proof in saved credential. Claim/hydration did not return a VC with Iden3SparseMerkleTreeProof. proofTypes: ${
+        proofTypes.length > 0 ? proofTypes.join(", ") : "none"
+      }`
+    );
   }
 
   return {

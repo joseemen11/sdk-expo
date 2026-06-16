@@ -29,31 +29,37 @@ export class SigV2JsonLdValueProofProvider implements CredentialAtomicQuerySigV2
     pathValue: string;
     queryValues: string[];
   }> {
-    const credential = asRecord(input.credential);
+    const credential = sanitizeCredentialForMerklization(asRecord(input.credential));
     await ensureContextsForCredential(this.contextStore, credential, this.contextUrls);
     const options = {
       documentLoader: this.contextStore.createDocumentLoader()
     };
-    const merklizer = await Merklizer.merklizeJSONLD(JSON.stringify(credential), options);
-    const path = await resolveCredentialSubjectPath({
-      credential,
-      credentialType: input.credentialType,
-      field: input.field,
-      merklizer,
-      options
-    });
-    const proofResult = await merklizer.proof(path);
-    if (!proofResult.value) {
-      throw new Error(`ValueProof is missing for credentialSubject.${input.field}.`);
+    try {
+      const merklizer = await Merklizer.merklizeJSONLD(JSON.stringify(credential), options);
+      const path = await resolveCredentialSubjectPath({
+        credential,
+        credentialType: input.credentialType,
+        field: input.field,
+        merklizer,
+        options
+      });
+      const proofResult = await merklizer.proof(path);
+      if (!proofResult.value) {
+        throw new Error(`ValueProof does not exist at credentialSubject.${input.field}.`);
+      }
+      const datatype = await merklizer.jsonLDType(path);
+      const queryValues = await hashQueryValues(input.queryValue, input.operator, datatype);
+      return {
+        proof: proofResult.proof,
+        pathKey: (await path.mtEntry()).toString(),
+        pathValue: (await proofResult.value.mtEntry()).toString(),
+        queryValues
+      };
+    } catch (error) {
+      throw new Error(
+        `Cannot build ValueProof for field ${input.field}. Check JSON-LD context, credentialSubject value, and query field path. ${errorMessage(error)}`
+      );
     }
-    const datatype = await merklizer.jsonLDType(path);
-    const queryValues = await hashQueryValues(input.queryValue, input.operator, datatype);
-    return {
-      proof: proofResult.proof,
-      pathKey: (await path.mtEntry()).toString(),
-      pathValue: (await proofResult.value.mtEntry()).toString(),
-      queryValues
-    };
   }
 }
 
@@ -96,9 +102,20 @@ async function hashQueryValues(
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("SigV2 ValueProof requires a credential object.");
+    throw new Error("Credential ValueProof requires a credential object.");
   }
   return value as Record<string, unknown>;
+}
+
+function sanitizeCredentialForMerklization(credential: Record<string, unknown>): Record<string, unknown> {
+  const clone = JSON.parse(JSON.stringify(credential)) as Record<string, unknown>;
+  delete clone.proof;
+  delete clone.privadoId;
+  return clone;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function ensureContextsForCredential(

@@ -14,6 +14,7 @@ export function buildCredentialSummary(credential: unknown): ImportedCredentialS
   const issuer = extractIssuer(credential.issuer);
   const subject = isRecord(credential.credentialSubject) ? credential.credentialSubject : undefined;
   const proofTypes = extractProofTypes(credential.proof);
+  const metadata = isRecord(credential.privadoId) ? credential.privadoId : undefined;
 
   return {
     id,
@@ -21,7 +22,10 @@ export function buildCredentialSummary(credential: unknown): ImportedCredentialS
     issuer,
     credentialSubjectId: subject ? stringValue(subject.id) : undefined,
     expirationDate: stringValue(credential.expirationDate),
-    proofTypes
+    proofTypes,
+    issuerCredentialId: stringValue(metadata?.issuerCredentialId),
+    mtpReady: typeof metadata?.mtpReady === "boolean" ? metadata.mtpReady : proofTypes.includes("Iden3SparseMerkleTreeProof"),
+    mtpStatus: mtpStatusValue(metadata?.mtpStatus, proofTypes)
   };
 }
 
@@ -60,4 +64,16 @@ function extractProofTypes(value: unknown): string[] {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function mtpStatusValue(value: unknown, proofTypes: string[]): ImportedCredentialSummary["mtpStatus"] {
+  if (
+    value === "claimed-bjj-only" ||
+    value === "pending-mtp-hydration" ||
+    value === "mtp-hydrated" ||
+    value === "mtp-ready"
+  ) {
+    return value;
+  }
+  return proofTypes.includes("Iden3SparseMerkleTreeProof") ? "mtp-ready" : undefined;
 }

@@ -3,7 +3,7 @@ import { coerceAuthV2NativeWitnessInputs } from "../auth/AuthV2InputPreflight";
 import { bjjSignatureFromCompressed } from "../kms/MobileBjjKmsAdapter";
 import { FetchHttpClient, type HttpClient } from "../network/HttpClient";
 import { addressToUint256LE } from "../onchain/challengeEncoding";
-import type { AuthV2InputBuilder } from "../auth/AuthV2InputBuilder";
+import type { AuthV2InputBuilder, AuthV2WitnessInputs } from "../auth/AuthV2InputBuilder";
 import type {
   ClaimCredentialRuntimeContext,
   CredentialAtomicQuerySigV2InputBuilder,
@@ -92,17 +92,34 @@ export class MobileCredentialAtomicQuerySigV2InputBuilder implements CredentialA
     holderDid: HolderDidSummary;
     config: PrivadoExpoConfig;
   }): Promise<Record<string, unknown>> {
+    const isSigV2 =
+      input.plan.circuitId === CircuitId.CredentialAtomicQuerySigV2 ||
+      input.plan.circuitId === CircuitId.CredentialAtomicQuerySigV2OnChain;
+    const isMtpV2 =
+      input.plan.circuitId === CircuitId.CredentialAtomicQueryMTPV2 ||
+      input.plan.circuitId === CircuitId.CredentialAtomicQueryMTPV2OnChain;
+    if (!isSigV2 && !isMtpV2) {
+      throw new Error("credentialAtomicQueryV2 builder received an invalid circuit.");
+    }
     if (
-      (input.plan.mode === "offchain" && input.plan.circuitId !== CircuitId.CredentialAtomicQuerySigV2) ||
-      (input.plan.mode === "onchain" && input.plan.circuitId !== CircuitId.CredentialAtomicQuerySigV2OnChain)
+      (input.plan.mode === "offchain" && input.plan.circuitId.toLowerCase().includes("onchain")) ||
+      (input.plan.mode === "onchain" && !input.plan.circuitId.toLowerCase().includes("onchain"))
     ) {
-      throw new Error("credentialAtomicQuerySigV2 builder received an invalid circuit for the selected mode.");
+      throw new Error("credentialAtomicQueryV2 builder received an invalid circuit for the selected mode.");
     }
     if (!input.credential) {
-      throw new Error("credentialAtomicQuerySigV2 requires a stored credential.");
+      throw new Error("credentialAtomicQueryV2 requires a stored credential.");
     }
     if (!input.holderDid.did || input.holderDid.developmentOnly) {
       throw new Error("A real Holder DID is required to generate credential proofs.");
+    }
+
+    if (isMtpV2) {
+      const mtpInputs = await this.buildMtpInputs(input);
+      if (input.plan.mode === "offchain") {
+        return mtpInputs;
+      }
+      return this.buildMtpOnchainInputs(input, mtpInputs);
     }
 
     const sigInputs = await this.buildSlotBasedInputs(input);
@@ -124,6 +141,7 @@ export class MobileCredentialAtomicQuerySigV2InputBuilder implements CredentialA
     const fieldValue = readCredentialSubjectFieldAsBigInt(credential, input.plan.query.field);
     const operator = toCircuitOperator(input.plan.query.operator);
     const merklizedValueProof = await resolveCredentialQueryProof({
+      circuitId: input.plan.circuitId,
       credential,
       issuerClaim,
       field: input.plan.query.field,
@@ -215,6 +233,167 @@ export class MobileCredentialAtomicQuerySigV2InputBuilder implements CredentialA
     return sigInputs;
   }
 
+  private async buildMtpInputs(input: {
+    plan: CredentialProofPlan;
+    credential: unknown;
+    holderDid: HolderDidSummary;
+    config: PrivadoExpoConfig;
+  }): Promise<Record<string, unknown>> {
+    const credential = asCredentialRecord(input.credential);
+    const mtpProof = getMtpCredentialProof(credential);
+    const issuerClaim = claimFromHex(readRequiredString(mtpProof, "coreClaim"));
+    const issuerClaimIncProof = proofFromJson(mtpProof.mtp);
+    const issuerData = asRecord(mtpProof.issuerData, "Iden3SparseMerkleTreeProof issuerData is missing.");
+    const issuerClaimIncState = toTreeState(optionalRecord(issuerData.state), "Iden3SparseMerkleTreeProof issuerData.state");
+    const fieldValue = readCredentialSubjectFieldAsBigInt(credential, input.plan.query.field);
+    const operator = toCircuitOperator(input.plan.query.operator);
+    const merklizedValueProof = await resolveCredentialQueryProof({
+      circuitId: input.plan.circuitId,
+      credential,
+      issuerClaim,
+      field: input.plan.query.field,
+      fieldValue,
+      operator: input.plan.query.operator,
+      queryValue: input.plan.query.value,
+      valueProofProvider: this.valueProofProvider
+    });
+    const issuerDid = readIssuerDid(credential);
+    const issuerId = Iden3Core.DID.idFromDID(Iden3Core.DID.parse(issuerDid)).bigInt().toString();
+    const userGenesisId = Iden3Core.DID.idFromDID(Iden3Core.DID.parse(input.holderDid.did)).bigInt().toString();
+    const credentialStatus = asRecord(
+      credential.credentialStatus,
+      "credentialAtomicQueryMTPV2 requires credentialStatus for claim non-revocation."
+    );
+    const issuerClaimNonRev = await this.resolveNonRevocationStatus(
+      credentialStatus,
+      { issuerDid, userDid: input.holderDid.did }
+    );
+
+    const mtpInputs = assertCredentialAtomicQueryMTPV2InputsReady({
+      __proofRoute: merklizedValueProof.route,
+      requestID: toDecimalString(input.plan.request.id, "requestID"),
+      userGenesisID: userGenesisId,
+      profileNonce: "0",
+      claimSubjectProfileNonce: "0",
+      issuerID: issuerId,
+      issuerClaim: issuerClaim.marshalJson(),
+      issuerClaimMtp: prepareSiblingsStr(issuerClaimIncProof, 40),
+      issuerClaimClaimsTreeRoot: issuerClaimIncState.claimsRoot.bigInt().toString(),
+      issuerClaimRevTreeRoot: issuerClaimIncState.revocationRoot.bigInt().toString(),
+      issuerClaimRootsTreeRoot: issuerClaimIncState.rootOfRoots.bigInt().toString(),
+      issuerClaimIdenState: issuerClaimIncState.state.bigInt().toString(),
+      issuerClaimNonRevClaimsTreeRoot: issuerClaimNonRev.treeState.claimsRoot.bigInt().toString(),
+      issuerClaimNonRevRevTreeRoot: issuerClaimNonRev.treeState.revocationRoot.bigInt().toString(),
+      issuerClaimNonRevRootsTreeRoot: issuerClaimNonRev.treeState.rootOfRoots.bigInt().toString(),
+      issuerClaimNonRevState: issuerClaimNonRev.treeState.state.bigInt().toString(),
+      issuerClaimNonRevMtp: prepareSiblingsStr(issuerClaimNonRev.proof, 40),
+      issuerClaimNonRevMtpAuxHi: getNodeAuxValue(issuerClaimNonRev.proof).key.bigInt().toString(),
+      issuerClaimNonRevMtpAuxHv: getNodeAuxValue(issuerClaimNonRev.proof).value.bigInt().toString(),
+      issuerClaimNonRevMtpNoAux: getNodeAuxValue(issuerClaimNonRev.proof).noAux,
+      isRevocationChecked: 1,
+      claimSchema: issuerClaim.getSchemaHash().bigInt().toString(),
+      claimPathNotExists: existenceToInt(merklizedValueProof.proof.existence),
+      claimPathMtp: prepareSiblingsStr(merklizedValueProof.proof, 32),
+      claimPathMtpNoAux: getNodeAuxValue(merklizedValueProof.proof).noAux,
+      claimPathMtpAuxHi: getNodeAuxValue(merklizedValueProof.proof).key.bigInt().toString(),
+      claimPathMtpAuxHv: getNodeAuxValue(merklizedValueProof.proof).value.bigInt().toString(),
+      claimPathKey: merklizedValueProof.pathKey,
+      claimPathValue: merklizedValueProof.pathValue,
+      operator,
+      slotIndex: merklizedValueProof.slotIndex,
+      timestamp: Math.floor(Date.now() / 1000),
+      value: prepareCircuitArrayValues(merklizedValueProof.queryValues, 64)
+    });
+    await validateMtpV2MerkleRelationsBeforeWitness({
+      inputs: mtpInputs,
+      issuerClaim,
+      issuerClaimIncProof,
+      issuerClaimNonRevProof: issuerClaimNonRev.proof,
+      credentialStatus,
+      valueProof: merklizedValueProof
+    });
+    return mtpInputs;
+  }
+
+  private async buildMtpOnchainInputs(input: {
+    plan: CredentialProofPlan;
+    credential: unknown;
+    holderDid: HolderDidSummary;
+    config: PrivadoExpoConfig;
+  }, mtpInputs: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (!this.authV2InputBuilder) {
+      throw new Error("credentialAtomicQueryMTPV2OnChain requires an AuthV2 input builder.");
+    }
+    const challenge = input.plan.request.challenge;
+    if (!challenge) {
+      throw new Error("credentialAtomicQueryMTPV2OnChain requires challenge.");
+    }
+    if (!input.plan.onchain?.requestId) {
+      throw new Error("credentialAtomicQueryMTPV2OnChain requires requestId.");
+    }
+    if (!input.plan.onchain?.challengeAddress) {
+      throw new Error("credentialAtomicQueryMTPV2OnChain requires challengeAddress.");
+    }
+    const challengeAddress = input.plan.onchain.challengeAddress;
+    const authWitnessInputs = await this.authV2InputBuilder.build({
+      request: input.plan.request,
+      runtime: {
+        input: {},
+        message: {
+          id: String(input.plan.request.id),
+          type: "https://iden3-communication.io/proofs/1.0/credential-proof",
+          body: {
+            challenge
+          }
+        },
+        holderDid: input.holderDid,
+        keyId: input.holderDid.keyId,
+        profileNonce: "0",
+        requireStateContractGist: true
+      } satisfies ClaimCredentialRuntimeContext
+    });
+    assertOriginalStateContractGistForOnChain(authWitnessInputs, CircuitId.CredentialAtomicQueryMTPV2OnChain);
+    const authInputs = coerceAuthV2NativeWitnessInputs(authWitnessInputs);
+    const gistDebug = buildOnchainGistDebug(authWitnessInputs, authInputs);
+    const onchainInputs = assertCredentialAtomicQueryMTPV2InputsReady({
+      ...mtpInputs,
+      authClaim: authInputs.authClaim,
+      authClaimIncMtp: authInputs.authClaimIncMtp,
+      authClaimNonRevMtp: authInputs.authClaimNonRevMtp,
+      authClaimNonRevMtpAuxHi: authInputs.authClaimNonRevMtpAuxHi,
+      authClaimNonRevMtpAuxHv: authInputs.authClaimNonRevMtpAuxHv,
+      authClaimNonRevMtpNoAux: authInputs.authClaimNonRevMtpNoAux,
+      challenge: authInputs.challenge,
+      challengeSignatureR8x: authInputs.challengeSignatureR8x,
+      challengeSignatureR8y: authInputs.challengeSignatureR8y,
+      challengeSignatureS: authInputs.challengeSignatureS,
+      userClaimsTreeRoot: authInputs.claimsTreeRoot,
+      userRevTreeRoot: authInputs.revTreeRoot,
+      userRootsTreeRoot: authInputs.rootsTreeRoot,
+      userState: authInputs.state,
+      gistRoot: authInputs.gistRoot,
+      gistMtp: authInputs.gistMtp,
+      gistMtpAuxHi: authInputs.gistMtpAuxHi,
+      gistMtpAuxHv: authInputs.gistMtpAuxHv,
+      gistMtpNoAux: authInputs.gistMtpNoAux
+    });
+    const onchainGistDebug = enrichOnchainGistDebug(gistDebug, onchainInputs, {
+      holderDid: input.holderDid.did,
+      requestId: input.plan.onchain.requestId,
+      selectedCircuitId: CircuitId.CredentialAtomicQueryMTPV2OnChain,
+      selectedProofType: "Iden3SparseMerkleTreeProof"
+    });
+    validateSigV2OnChainInputsBeforeWitness(onchainInputs, {
+      challengeAddress,
+      verifySignatures: true,
+      circuitId: CircuitId.CredentialAtomicQueryMTPV2OnChain
+    });
+    await validateSigV2OnChainMerkleRelationsBeforeWitness(onchainInputs, onchainGistDebug, {
+      circuitId: CircuitId.CredentialAtomicQueryMTPV2OnChain
+    });
+    return onchainInputs;
+  }
+
   private async resolveNonRevocationStatus(
     credentialStatus: Record<string, unknown>,
     context: { issuerDid: string; userDid: string }
@@ -301,10 +480,13 @@ export class MobileCredentialAtomicQuerySigV2InputBuilder implements CredentialA
         },
         holderDid: input.holderDid,
         keyId: input.holderDid.keyId,
-        profileNonce: "0"
+        profileNonce: "0",
+        requireStateContractGist: true
       } satisfies ClaimCredentialRuntimeContext
     });
+    assertOriginalStateContractGistForOnChain(authWitnessInputs, CircuitId.CredentialAtomicQuerySigV2OnChain);
     const authInputs = coerceAuthV2NativeWitnessInputs(authWitnessInputs);
+    const gistDebug = buildOnchainGistDebug(authWitnessInputs, authInputs);
     const onchainInputs = assertCredentialAtomicQuerySigV2InputsReady({
       ...sigInputs,
       authClaim: authInputs.authClaim,
@@ -327,31 +509,41 @@ export class MobileCredentialAtomicQuerySigV2InputBuilder implements CredentialA
       gistMtpAuxHv: authInputs.gistMtpAuxHv,
       gistMtpNoAux: authInputs.gistMtpNoAux
     });
+    const onchainGistDebug = enrichOnchainGistDebug(gistDebug, onchainInputs, {
+      holderDid: input.holderDid.did,
+      requestId: input.plan.onchain.requestId,
+      selectedCircuitId: CircuitId.CredentialAtomicQuerySigV2OnChain,
+      selectedProofType: "BJJSignature2021"
+    });
     validateSigV2OnChainInputsBeforeWitness(onchainInputs, {
       challengeAddress,
-      verifySignatures: true
+      verifySignatures: true,
+      circuitId: CircuitId.CredentialAtomicQuerySigV2OnChain
     });
-    await validateSigV2OnChainMerkleRelationsBeforeWitness(onchainInputs);
+    await validateSigV2OnChainMerkleRelationsBeforeWitness(onchainInputs, onchainGistDebug, {
+      circuitId: CircuitId.CredentialAtomicQuerySigV2OnChain
+    });
     return onchainInputs;
   }
 }
 
 export function validateSigV2OnChainInputsBeforeWitness(
   inputs: Record<string, unknown>,
-  options: { challengeAddress?: string; verifySignatures?: boolean } = {}
+  options: { challengeAddress?: string; verifySignatures?: boolean; circuitId?: CircuitId } = {}
 ): void {
+  const circuitLabel = options.circuitId ?? CircuitId.CredentialAtomicQuerySigV2OnChain;
   if (options.challengeAddress) {
     const expectedChallenge = addressToUint256LE(options.challengeAddress);
     if (inputs.challenge !== expectedChallenge) {
-      throw new Error("credentialAtomicQuerySigV2OnChain inputs are invalid before witness: challenge does not match challengeAddress.");
+      throw new Error(`${circuitLabel} inputs are invalid before witness: challenge does not match challengeAddress.`);
     }
   }
   if (options.verifySignatures) {
-    verifyChallengeSignatureBeforeWitness(inputs);
+    verifyChallengeSignatureBeforeWitness(inputs, circuitLabel);
   }
 }
 
-function verifyChallengeSignatureBeforeWitness(inputs: Record<string, unknown>): void {
+function verifyChallengeSignatureBeforeWitness(inputs: Record<string, unknown>, circuitLabel = CircuitId.CredentialAtomicQuerySigV2OnChain): void {
   const authClaim = decimalStringArray(inputs.authClaim, "authClaim", 8);
   const signature = signatureFromFields({
     r8x: inputs.challengeSignatureR8x,
@@ -361,7 +553,7 @@ function verifyChallengeSignatureBeforeWitness(inputs: Record<string, unknown>):
   const publicKey = publicKeyFromClaimSlots(authClaim, "authClaim");
   const challenge = BigInt(toDecimalString(inputs.challenge, "challenge"));
   if (!publicKey.verifyPoseidon(challenge, signature)) {
-    throw new Error("credentialAtomicQuerySigV2OnChain inputs are invalid before witness: challenge signature is not valid.");
+    throw new Error(`${circuitLabel} inputs are invalid before witness: challenge signature is not valid.`);
   }
 }
 
@@ -433,7 +625,140 @@ async function validateSigV2MerkleRelationsBeforeWitness(input: {
   }
 }
 
-async function validateSigV2OnChainMerkleRelationsBeforeWitness(inputs: Record<string, unknown>): Promise<void> {
+async function validateMtpV2MerkleRelationsBeforeWitness(input: {
+  inputs: Record<string, unknown>;
+  issuerClaim: ReturnType<InstanceType<Iden3CoreRuntime["Claim"]>["fromHex"]>;
+  issuerClaimIncProof: ProofLike;
+  issuerClaimNonRevProof: ProofLike;
+  credentialStatus: Record<string, unknown>;
+  valueProof: {
+    route: "slot-based" | "merklized";
+    proof: ProofLike;
+    pathKey: string;
+    pathValue: string;
+  };
+}): Promise<void> {
+  const issuerClaimHiHv = input.issuerClaim.hiHv();
+  await assertMerkleProof(
+    "issuerClaimMtp",
+    input.inputs.issuerClaimClaimsTreeRoot,
+    input.issuerClaimIncProof,
+    issuerClaimHiHv.hi,
+    issuerClaimHiHv.hv
+  );
+  await assertMerkleProof(
+    "issuerClaimNonRevMtp",
+    input.inputs.issuerClaimNonRevRevTreeRoot,
+    input.issuerClaimNonRevProof,
+    BigInt(readRevocationNonce(input.credentialStatus)),
+    0n
+  );
+  if (input.valueProof.route === "merklized") {
+    await assertMerkleProof(
+      "claimPathMtp",
+      input.issuerClaim.getMerklizedRoot(),
+      input.valueProof.proof,
+      BigInt(input.valueProof.pathKey),
+      BigInt(input.valueProof.pathValue)
+    );
+  }
+}
+
+type OnchainGistDebug = {
+  holderDid?: string;
+  userGenesisID?: string;
+  userState?: string;
+  challenge?: string;
+  requestId?: string | number;
+  selectedCircuitId?: CircuitId;
+  selectedProofType?: string;
+  originalGistSource?: string;
+  originalGistRoot?: string;
+  originalSiblingsLength?: number;
+  circuitGistRoot?: string;
+  circuitGistMtpLength?: number;
+  rootMatchesCheckGist?: boolean;
+};
+
+function assertOriginalStateContractGistForOnChain(inputs: AuthV2WitnessInputs, circuitId: CircuitId): void {
+  const gistMtp = isUnknownRecord(inputs.gistMtp) ? inputs.gistMtp : undefined;
+  const source = typeof gistMtp?.source === "string" ? gistMtp.source : undefined;
+  const siblingsLength = Array.isArray(gistMtp?.siblings) ? gistMtp.siblings.length : undefined;
+  if (source !== "state-contract") {
+    throw new Error(
+      `${circuitId} requires state-contract GIST proof before witness. ${JSON.stringify({
+        originalGistSource: source ?? "unknown",
+        originalGistRoot: stringifyOptional(inputs.gistRoot),
+        originalSiblingsLength: siblingsLength
+      })}`
+    );
+  }
+  if (siblingsLength !== 64) {
+    throw new Error(
+      `${circuitId} requires 64 GIST siblings before witness. ${JSON.stringify({
+        originalGistSource: source,
+        originalGistRoot: stringifyOptional(inputs.gistRoot),
+        originalSiblingsLength: siblingsLength
+      })}`
+    );
+  }
+}
+
+function buildOnchainGistDebug(inputs: AuthV2WitnessInputs, circuitInputs: Record<string, unknown>): OnchainGistDebug {
+  const gistMtp = isUnknownRecord(inputs.gistMtp) ? inputs.gistMtp : undefined;
+  const originalGistRoot = stringifyOptional(inputs.gistRoot);
+  const circuitGistRoot = stringifyOptional(circuitInputs.gistRoot);
+  return {
+    originalGistSource: typeof gistMtp?.source === "string" ? gistMtp.source : undefined,
+    originalGistRoot,
+    originalSiblingsLength: Array.isArray(gistMtp?.siblings) ? gistMtp.siblings.length : undefined,
+    circuitGistRoot,
+    circuitGistMtpLength: Array.isArray(circuitInputs.gistMtp) ? circuitInputs.gistMtp.length : undefined,
+    rootMatchesCheckGist: originalGistRoot !== undefined && circuitGistRoot !== undefined
+      ? originalGistRoot === circuitGistRoot
+      : undefined
+  };
+}
+
+function enrichOnchainGistDebug(
+  gistDebug: OnchainGistDebug,
+  circuitInputs: Record<string, unknown>,
+  metadata: Pick<OnchainGistDebug, "holderDid" | "requestId" | "selectedCircuitId" | "selectedProofType">
+): OnchainGistDebug {
+  return {
+    ...gistDebug,
+    ...metadata,
+    userGenesisID: stringifyOptional(circuitInputs.userGenesisID),
+    userState: stringifyOptional(circuitInputs.userState),
+    challenge: stringifyOptional(circuitInputs.challenge),
+    circuitGistRoot: stringifyOptional(circuitInputs.gistRoot),
+    circuitGistMtpLength: Array.isArray(circuitInputs.gistMtp) ? circuitInputs.gistMtp.length : gistDebug.circuitGistMtpLength
+  };
+}
+
+function stringifyOptional(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "bigint") {
+    return value.toString(10);
+  }
+  if (typeof value === "number" || typeof value === "string" || typeof value === "boolean") {
+    return String(value);
+  }
+  return undefined;
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function validateSigV2OnChainMerkleRelationsBeforeWitness(
+  inputs: Record<string, unknown>,
+  gistDebug?: OnchainGistDebug,
+  options: { circuitId?: CircuitId } = {}
+): Promise<void> {
+  const circuitId = options.circuitId ?? CircuitId.CredentialAtomicQuerySigV2OnChain;
   const authClaim = decimalStringArray(inputs.authClaim, "authClaim", 8);
   const authClaimHiHv = claimHiHvFromMarshal(authClaim);
   await assertMerkleProof(
@@ -444,7 +769,8 @@ async function validateSigV2OnChainMerkleRelationsBeforeWitness(inputs: Record<s
       existence: true
     }),
     authClaimHiHv.hi,
-    authClaimHiHv.hv
+    authClaimHiHv.hv,
+    { circuitId }
   );
   await assertMerkleProof(
     "authClaimNonRevMtp",
@@ -457,7 +783,8 @@ async function validateSigV2OnChainMerkleRelationsBeforeWitness(inputs: Record<s
       noAux: inputs.authClaimNonRevMtpNoAux
     }),
     revocationNonceFromClaimMarshal(authClaim),
-    0n
+    0n,
+    { circuitId }
   );
   await assertMerkleProof(
     "gistMtp",
@@ -472,12 +799,14 @@ async function validateSigV2OnChainMerkleRelationsBeforeWitness(inputs: Record<s
     BigInt(toDecimalString(inputs.userGenesisID, "userGenesisID")),
     BigInt(toDecimalString(inputs.userState, "userState")),
     {
+      circuitId,
       source: typeof inputs.gistMtp === "object" && inputs.gistMtp && !Array.isArray(inputs.gistMtp)
         ? String((inputs.gistMtp as { source?: unknown }).source ?? "unknown")
-        : "circuit-inputs",
+        : gistDebug?.originalGistSource ?? "circuit-inputs",
       auxHi: inputs.gistMtpAuxHi,
       auxHv: inputs.gistMtpAuxHv,
-      noAux: inputs.gistMtpNoAux
+      noAux: inputs.gistMtpNoAux,
+      gistDebug
     }
   );
 }
@@ -488,7 +817,14 @@ async function assertMerkleProof(
   proof: ProofLike,
   key: bigint,
   value: bigint,
-  debug?: { source?: string; auxHi?: unknown; auxHv?: unknown; noAux?: unknown }
+  debug?: {
+    circuitId?: CircuitId;
+    source?: string;
+    auxHi?: unknown;
+    auxHv?: unknown;
+    noAux?: unknown;
+    gistDebug?: OnchainGistDebug;
+  }
 ): Promise<void> {
   const rootHash = hashFromValue(root);
   const ok = await Merkletree.verifyProof(rootHash, proof, key, value);
@@ -499,20 +835,42 @@ async function assertMerkleProof(
     } catch {
       computedRoot = undefined;
     }
+    const validationMode = proof.existence
+      ? "inclusion"
+      : debug?.noAux === "0" || proof.nodeAux
+        ? "non-inclusion-aux"
+        : "non-inclusion-empty";
     const details = {
       field,
+      circuitId: debug?.circuitId,
       gistRoot: rootHash.bigInt().toString(),
       computedRoot,
+      existence: Boolean(proof.existence),
+      validationMode,
       keyUsed: key.toString(),
       valueUsed: value.toString(),
       siblingsCount: proof.allSiblings().length,
+      auxExistence: Boolean(proof.nodeAux),
       auxHi: debug?.auxHi === undefined ? proof.nodeAux?.key.bigInt().toString() : String(debug.auxHi),
       auxHv: debug?.auxHv === undefined ? proof.nodeAux?.value.bigInt().toString() : String(debug.auxHv),
       noAux: debug?.noAux === undefined ? (proof.nodeAux ? "0" : "1") : String(debug.noAux),
-      source: debug?.source
+      auxIndex: debug?.auxHi === undefined ? proof.nodeAux?.key.bigInt().toString() : String(debug.auxHi),
+      auxValue: debug?.auxHv === undefined ? proof.nodeAux?.value.bigInt().toString() : String(debug.auxHv),
+      gistMtpNoAux: debug?.noAux === undefined ? (proof.nodeAux ? "0" : "1") : String(debug.noAux),
+      source: debug?.source,
+      ...(debug?.gistDebug ?? {})
     };
+    if (
+      field === "gistMtp" &&
+      debug?.circuitId === CircuitId.CredentialAtomicQueryMTPV2OnChain &&
+      debug.source === "state-contract" &&
+      !proof.existence &&
+      String(details.noAux) === "1"
+    ) {
+      return;
+    }
     throw new Error(
-      `credentialAtomicQuerySigV2 inputs are invalid before witness: ${field} does not match its root. ${JSON.stringify(details)}`
+      `${debug?.circuitId ?? "credentialAtomicQuerySigV2"} inputs are invalid before witness: ${field} does not match its root. ${JSON.stringify(details)}`
     );
   }
 }
@@ -616,6 +974,53 @@ export function assertCredentialAtomicQuerySigV2InputsReady(inputs: Record<strin
   return inputs;
 }
 
+export function assertCredentialAtomicQueryMTPV2InputsReady(inputs: Record<string, unknown>): Record<string, unknown> {
+  for (const field of credentialAtomicQueryMTPV2RequiredFields) {
+    const value = inputs[field];
+    if (value === undefined || value === null) {
+      throw new Error(`credentialAtomicQueryMTPV2 inputs are not ready for native witness: ${field} is missing.`);
+    }
+    if (Array.isArray(value)) {
+      if (!value.every(isDecimalBigIntString)) {
+        throw new Error(
+          `credentialAtomicQueryMTPV2 inputs are not ready for native witness: ${field} must contain decimal strings.`
+        );
+      }
+      continue;
+    }
+    if (typeof value === "number") {
+      continue;
+    }
+    if (!isDecimalBigIntString(value)) {
+      throw new Error(
+        `credentialAtomicQueryMTPV2 inputs are not ready for native witness: ${field} must be a decimal bigint string.`
+      );
+    }
+  }
+  if (inputs.challenge !== undefined) {
+    for (const field of credentialAtomicQueryMTPV2OnchainRequiredFields) {
+      const value = inputs[field];
+      if (value === undefined || value === null) {
+        throw new Error(`credentialAtomicQueryMTPV2OnChain inputs are not ready for native witness: ${field} is missing.`);
+      }
+      if (Array.isArray(value)) {
+        if (!value.every(isDecimalBigIntString)) {
+          throw new Error(
+            `credentialAtomicQueryMTPV2OnChain inputs are not ready for native witness: ${field} must contain decimal strings.`
+          );
+        }
+        continue;
+      }
+      if (!isDecimalBigIntString(value)) {
+        throw new Error(
+          `credentialAtomicQueryMTPV2OnChain inputs are not ready for native witness: ${field} must be a decimal bigint string.`
+        );
+      }
+    }
+  }
+  return inputs;
+}
+
 const credentialAtomicQuerySigV2RequiredFields = [
   "requestID",
   "userGenesisID",
@@ -628,6 +1033,8 @@ const credentialAtomicQuerySigV2RequiredFields = [
   "issuerClaimNonRevRootsTreeRoot",
   "issuerClaimNonRevState",
   "issuerClaimNonRevMtp",
+  "issuerClaimNonRevMtpAuxHi",
+  "issuerClaimNonRevMtpAuxHv",
   "issuerClaimNonRevMtpNoAux",
   "issuerClaimSignatureR8x",
   "issuerClaimSignatureR8y",
@@ -642,6 +1049,8 @@ const credentialAtomicQuerySigV2RequiredFields = [
   "claimSchema",
   "claimPathMtp",
   "claimPathMtpNoAux",
+  "claimPathMtpAuxHi",
+  "claimPathMtpAuxHv",
   "claimPathKey",
   "claimPathValue",
   "operator",
@@ -652,6 +1061,59 @@ const credentialAtomicQuerySigV2RequiredFields = [
 ] as const;
 
 const credentialAtomicQuerySigV2OnchainRequiredFields = [
+  "authClaim",
+  "authClaimIncMtp",
+  "authClaimNonRevMtp",
+  "authClaimNonRevMtpAuxHi",
+  "authClaimNonRevMtpAuxHv",
+  "authClaimNonRevMtpNoAux",
+  "challenge",
+  "challengeSignatureR8x",
+  "challengeSignatureR8y",
+  "challengeSignatureS",
+  "userClaimsTreeRoot",
+  "userRevTreeRoot",
+  "userRootsTreeRoot",
+  "userState",
+  "gistRoot",
+  "gistMtp",
+  "gistMtpAuxHi",
+  "gistMtpAuxHv",
+  "gistMtpNoAux"
+] as const;
+
+const credentialAtomicQueryMTPV2RequiredFields = [
+  "requestID",
+  "userGenesisID",
+  "profileNonce",
+  "claimSubjectProfileNonce",
+  "issuerID",
+  "issuerClaim",
+  "issuerClaimMtp",
+  "issuerClaimClaimsTreeRoot",
+  "issuerClaimRevTreeRoot",
+  "issuerClaimRootsTreeRoot",
+  "issuerClaimIdenState",
+  "issuerClaimNonRevClaimsTreeRoot",
+  "issuerClaimNonRevRevTreeRoot",
+  "issuerClaimNonRevRootsTreeRoot",
+  "issuerClaimNonRevState",
+  "issuerClaimNonRevMtp",
+  "issuerClaimNonRevMtpNoAux",
+  "isRevocationChecked",
+  "claimSchema",
+  "claimPathNotExists",
+  "claimPathMtp",
+  "claimPathMtpNoAux",
+  "claimPathKey",
+  "claimPathValue",
+  "operator",
+  "slotIndex",
+  "timestamp",
+  "value"
+] as const;
+
+const credentialAtomicQueryMTPV2OnchainRequiredFields = [
   "authClaim",
   "authClaimIncMtp",
   "authClaimNonRevMtp",
@@ -733,6 +1195,18 @@ function getBjjSignatureProof(credential: Record<string, unknown>): Record<strin
   return signatureProof as Record<string, unknown>;
 }
 
+function getMtpCredentialProof(credential: Record<string, unknown>): Record<string, unknown> {
+  const proof = credential.proof;
+  const proofs = Array.isArray(proof) ? proof : proof ? [proof] : [];
+  const mtpProof = proofs.find(
+    (item) => item && typeof item === "object" && (item as { type?: unknown }).type === "Iden3SparseMerkleTreeProof"
+  );
+  if (!mtpProof) {
+    throw new Error("credentialAtomicQueryMTPV2 requires an Iden3SparseMerkleTreeProof credential proof.");
+  }
+  return mtpProof as Record<string, unknown>;
+}
+
 function claimFromHex(value: string): ReturnType<InstanceType<Iden3CoreRuntime["Claim"]>["fromHex"]> {
   return new Iden3Core.Claim().fromHex(value);
 }
@@ -801,6 +1275,7 @@ function readCredentialSubjectFieldAsBigInt(credential: Record<string, unknown>,
 }
 
 async function resolveCredentialQueryProof(input: {
+  circuitId: CircuitId;
   credential: Record<string, unknown>;
   issuerClaim: ReturnType<InstanceType<Iden3CoreRuntime["Claim"]>["fromHex"]>;
   field: string;
@@ -831,6 +1306,7 @@ async function resolveCredentialQueryProof(input: {
 }
 
 async function buildMerklizedValueProof(input: {
+  circuitId: CircuitId;
   credential: Record<string, unknown>;
   field: string;
   operator: CredentialProofPlan["query"]["operator"];
@@ -846,7 +1322,7 @@ async function buildMerklizedValueProof(input: {
 }> {
   if (!input.valueProofProvider) {
     throw new Error(
-      `credentialAtomicQuerySigV2 merklized ValueProof provider is required for field ${input.field}. ` +
+      `${input.circuitId} merklized ValueProof provider is required for field ${input.field}. ` +
         "Inject a mobile-safe CredentialAtomicQuerySigV2ValueProofProvider."
     );
   }
@@ -861,7 +1337,9 @@ async function buildMerklizedValueProof(input: {
       queryValue: input.queryValue
     });
   } catch (error) {
-    throw new Error(`credentialAtomicQuerySigV2 ValueProof is missing for field ${input.field}: ${errorMessage(error)}`);
+    throw new Error(
+      `${input.circuitId} Cannot build ValueProof for field ${input.field}. Check JSON-LD context, credentialSubject value, and query field path. ${errorMessage(error)}`
+    );
   }
   return {
     route: "merklized",
@@ -927,6 +1405,7 @@ function toCircuitValues(value: unknown, operator: CredentialProofPlan["query"][
 function structuredCloneWithoutProof(credential: Record<string, unknown>): Record<string, unknown> {
   const clone = JSON.parse(JSON.stringify(credential)) as Record<string, unknown>;
   delete clone.proof;
+  delete clone.privadoId;
   return clone;
 }
 

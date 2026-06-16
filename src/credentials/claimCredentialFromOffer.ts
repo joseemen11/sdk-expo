@@ -8,7 +8,9 @@ import type {
   CredentialStorageAdapter,
   Iden3commClaimProvider,
   IdentityStorageAdapter,
-  ImportedCredentialSummary
+  ImportedCredentialSummary,
+  IssuerCredentialResolver,
+  IssuerCredentialResolverResult
 } from "../types";
 
 export interface ClaimCredentialFromOfferOptions {
@@ -16,6 +18,7 @@ export interface ClaimCredentialFromOfferOptions {
   credentialStorage: CredentialStorageAdapter;
   authV2Provider?: AuthV2Provider;
   iden3commClaimProvider?: Iden3commClaimProvider;
+  issuerCredentialResolver?: IssuerCredentialResolver;
 }
 
 export async function claimCredentialFromOffer(
@@ -60,9 +63,17 @@ export async function claimCredentialFromOffer(
   if (credentials.length === 0) {
     throw new Error("Iden3comm claim provider did not return any credentials.");
   }
+  for (const credential of credentials) {
+    assertValidCredentialForStorage(credential);
+  }
+
+  const hydratedCredentials = await hydrateCredentialsForMtp(credentials, {
+    resolver: options.issuerCredentialResolver,
+    holderDid: holderDid.did
+  });
 
   const summaries: ImportedCredentialSummary[] = [];
-  for (const credential of credentials) {
+  for (const credential of hydratedCredentials) {
     assertValidCredentialForStorage(credential);
     summaries.push(await options.credentialStorage.saveCredential(credential));
   }
@@ -72,6 +83,34 @@ export async function claimCredentialFromOffer(
     credentialIds: summaries.map((summary) => summary.id),
     credentials: summaries
   };
+}
+
+async function hydrateCredentialsForMtp(
+  credentials: unknown[],
+  options: { resolver?: IssuerCredentialResolver; holderDid: string }
+): Promise<unknown[]> {
+  const output: unknown[] = [];
+  for (const credential of credentials) {
+    if (hasProofType(credential, "Iden3SparseMerkleTreeProof") || !options.resolver) {
+      output.push(credential);
+      continue;
+    }
+    const result: IssuerCredentialResolverResult = await options.resolver.resolveCredentialWithProof({
+      issuerDid: extractIssuer(credential),
+      credentialId: extractIssuerCredentialId(credential),
+      holderDid: options.holderDid,
+      credentialType: extractCredentialType(credential),
+      credentialSchema: extractCredentialSchema(credential),
+      requiredProofType: "Iden3SparseMerkleTreeProof",
+      claimedCredential: credential
+    });
+    if (result.credential && hasProofType(result.credential, "Iden3SparseMerkleTreeProof")) {
+      output.push(result.credential);
+      continue;
+    }
+    output.push(credential);
+  }
+  return output;
 }
 
 async function resolveHolderDid(
@@ -136,4 +175,62 @@ function isCredentialLike(value: Record<string, unknown>): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasProofType(credential: unknown, proofType: string): boolean {
+  return extractProofTypes(credential).includes(proofType);
+}
+
+function extractProofTypes(credential: unknown): string[] {
+  if (!isRecord(credential)) {
+    return [];
+  }
+  const proofs = Array.isArray(credential.proof) ? credential.proof : credential.proof ? [credential.proof] : [];
+  return proofs
+    .filter(isRecord)
+    .map((proof) => proof.type)
+    .flatMap((type) => Array.isArray(type) ? type : [type])
+    .filter((type): type is string => typeof type === "string" && type.length > 0);
+}
+
+function extractIssuerCredentialId(credential: unknown): string | undefined {
+  if (!isRecord(credential)) {
+    return undefined;
+  }
+  const candidates = [
+    credential.credentialId,
+    credential.id,
+    isRecord(credential.credentialSubject) ? credential.credentialSubject.id : undefined
+  ];
+  return candidates.find((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+function extractIssuer(credential: unknown): string | undefined {
+  if (!isRecord(credential)) {
+    return undefined;
+  }
+  if (typeof credential.issuer === "string") {
+    return credential.issuer;
+  }
+  return isRecord(credential.issuer) && typeof credential.issuer.id === "string" ? credential.issuer.id : undefined;
+}
+
+function extractCredentialType(credential: unknown): string | undefined {
+  if (!isRecord(credential)) {
+    return undefined;
+  }
+  const types = Array.isArray(credential.type) ? credential.type : [credential.type];
+  return [...types].reverse().find((value): value is string => typeof value === "string" && value !== "VerifiableCredential");
+}
+
+function extractCredentialSchema(credential: unknown): string | undefined {
+  if (!isRecord(credential)) {
+    return undefined;
+  }
+  if (typeof credential.credentialSchema === "string") {
+    return credential.credentialSchema;
+  }
+  return isRecord(credential.credentialSchema) && typeof credential.credentialSchema.id === "string"
+    ? credential.credentialSchema.id
+    : undefined;
 }

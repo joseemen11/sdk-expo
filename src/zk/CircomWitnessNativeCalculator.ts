@@ -28,10 +28,22 @@ export interface CircomWitnessGraphReader {
   readGraphBase64(graphPath: string): Promise<CircomWitnessGraphData>;
 }
 
+export interface CircomWitnessFileData {
+  witnessPath: string;
+  witnessBase64: string;
+  sizeBytes?: number;
+  sha256?: string;
+}
+
+export interface CircomWitnessFileWriter {
+  writeWitnessBase64(input: { circuitId: CircuitId; witnessBase64: string }): Promise<CircomWitnessFileData>;
+}
+
 export interface CircomWitnessNativeCalculatorOptions {
   module?: CircomWitnesscalcModule;
   loadModule?: () => CircomWitnesscalcModule;
   graphReader?: CircomWitnessGraphReader;
+  witnessWriter?: CircomWitnessFileWriter;
 }
 
 export interface CircomWitnessAvailabilityResult {
@@ -43,11 +55,13 @@ export class CircomWitnessNativeCalculator implements NativeWitnessCalculator {
   private readonly module?: CircomWitnesscalcModule;
   private readonly loadModule?: () => CircomWitnesscalcModule;
   private readonly graphReader?: CircomWitnessGraphReader;
+  private readonly witnessWriter?: CircomWitnessFileWriter;
 
   constructor(options: CircomWitnessNativeCalculatorOptions = {}) {
     this.module = options.module;
     this.loadModule = options.loadModule;
     this.graphReader = options.graphReader;
+    this.witnessWriter = options.witnessWriter;
   }
 
   async checkAvailable(): Promise<CircomWitnessAvailabilityResult> {
@@ -70,9 +84,30 @@ export class CircomWitnessNativeCalculator implements NativeWitnessCalculator {
       input.circuitId === CircuitId.AuthV2 ? coerceAuthV2NativeWitnessInputs(input.inputs) : input.inputs;
     const graph = await this.readGraph(input.graphPath);
     const witnesscalc = this.resolveModule();
-    const witness = await witnesscalc.calculateWitness(JSON.stringify(nativeInputs), graph.base64);
+    const inputJson = JSON.stringify(nativeInputs);
+    const inputByteLength = utf8ByteLength(inputJson);
+    const witness = await witnesscalc.calculateWitness(inputJson, graph.base64);
+    if (this.witnessWriter) {
+      const persisted = await this.witnessWriter.writeWitnessBase64({
+        circuitId: input.circuitId,
+        witnessBase64: witness
+      });
+      return {
+        witnessPath: persisted.witnessPath,
+        witness: persisted.witnessBase64,
+        witnessSource: "file",
+        witnessByteLength: persisted.sizeBytes ?? decodedBase64Size(persisted.witnessBase64),
+        witnessSha256: persisted.sha256,
+        inputByteLength,
+        inputSha256: "not-computed-on-device"
+      };
+    }
     return {
-      witness
+      witness,
+      witnessSource: "base64",
+      witnessByteLength: decodedBase64Size(witness),
+      inputByteLength,
+      inputSha256: "not-computed-on-device"
     };
   }
 
@@ -126,7 +161,9 @@ function supportsNativeWitness(circuitId: CircuitId): boolean {
   return (
     circuitId === CircuitId.AuthV2 ||
     circuitId === CircuitId.CredentialAtomicQuerySigV2 ||
-    circuitId === CircuitId.CredentialAtomicQuerySigV2OnChain
+    circuitId === CircuitId.CredentialAtomicQuerySigV2OnChain ||
+    circuitId === CircuitId.CredentialAtomicQueryMTPV2 ||
+    circuitId === CircuitId.CredentialAtomicQueryMTPV2OnChain
   );
 }
 
@@ -152,4 +189,8 @@ export function loadDefaultCircomWitnesscalcModule(): CircomWitnesscalcModule {
     throw new Error("Native witness calculator module is not available in this build.");
   }
   return mod as CircomWitnesscalcModule;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }

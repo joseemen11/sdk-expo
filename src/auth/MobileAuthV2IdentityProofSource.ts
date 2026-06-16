@@ -116,8 +116,12 @@ export class MobileAuthV2IdentityProofSource implements AuthV2IdentityProofSourc
     }
     const gistProof = await this.gistProofSource.getGISTProof(input.runtime.holderDid.did, {
       network: input.runtime.holderDid.network,
-      isStateGenesis: material.isStateGenesis
+      isStateGenesis: material.isStateGenesis,
+      allowResolverFallback: !input.runtime.requireStateContractGist
     });
+    if (input.runtime.requireStateContractGist && gistProof?.source !== "state-contract") {
+      throw new Error("AuthV2 GIST proof must come from state-contract for credentialAtomicQuerySigV2OnChain.");
+    }
     return gistProof ? toAuthV2GistProof(gistProof) : undefined;
   }
 

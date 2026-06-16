@@ -83,14 +83,29 @@ export class RapidsnarkNativeProver implements NativeProver {
       throw new Error("Native prover requires witness base64, not witnessPath, for @iden3/react-native-rapidsnark.");
     }
     const rapidsnark = this.resolveModule();
-    const result = await rapidsnark.groth16Prove(toNativeFilePath(input.zkeyPath), witness, {
+    const runId = createRunId(input.circuitId);
+    const startedAt = new Date().toISOString();
+    const zkeyPath = toNativeFilePath(input.zkeyPath);
+    const result = await rapidsnark.groth16Prove(zkeyPath, witness, {
       proofBufferSize: this.proofBufferSize,
       publicBufferSize: this.publicBufferSize,
       errorBufferSize: this.errorBufferSize
     });
+    const finishedAt = new Date().toISOString();
     return {
       proof: parseJsonOrString(result.proof),
-      publicSignals: parseJsonOrString(result.pub_signals)
+      publicSignals: parseJsonOrString(result.pub_signals),
+      rawProof: result.proof,
+      rawPublicSignals: result.pub_signals,
+      runId,
+      startedAt,
+      finishedAt,
+      zkeyPath,
+      witnessSource: input.witnessPath ? "file" : typeof input.witness === "string" ? "base64" : "unknown",
+      witnessPath: input.witnessPath,
+      witnessByteLength:
+        input.witnessByteLength ?? (typeof input.witness === "string" ? decodedBase64Size(input.witness) : undefined),
+      witnessSha256: input.witnessSha256
     };
   }
 
@@ -107,7 +122,9 @@ function supportsNativeProver(circuitId: CircuitId): boolean {
   return (
     circuitId === CircuitId.AuthV2 ||
     circuitId === CircuitId.CredentialAtomicQuerySigV2 ||
-    circuitId === CircuitId.CredentialAtomicQuerySigV2OnChain
+    circuitId === CircuitId.CredentialAtomicQuerySigV2OnChain ||
+    circuitId === CircuitId.CredentialAtomicQueryMTPV2 ||
+    circuitId === CircuitId.CredentialAtomicQueryMTPV2OnChain
   );
 }
 
@@ -136,4 +153,17 @@ function parseJsonOrString(value: string): unknown {
   } catch {
     return value;
   }
+}
+
+function createRunId(circuitId: CircuitId): string {
+  return `${circuitId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function decodedBase64Size(value: string): number {
+  const normalized = value.replace(/\s/g, "");
+  if (!normalized) {
+    return 0;
+  }
+  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
 }

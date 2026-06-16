@@ -31,6 +31,7 @@ export interface CircuitArtifactDownloadConfig {
   expectedFiles?: ZipCircuitExpectedFileMap;
   checksums?: Record<string, string>;
   version?: string;
+  forceRefresh?: boolean;
   onStatus?: (status: CircuitArtifactDownloadStatus) => void;
 }
 
@@ -74,6 +75,13 @@ export class CircuitArtifactDownloader {
 
     await this.options.fileSystem.makeDirectory(cacheDir);
     await this.options.fileSystem.makeDirectory(extractDir);
+
+    if (this.options.forceRefresh) {
+      await this.options.fileSystem.deleteFile?.(zipPath);
+      await this.options.fileSystem.deleteFile?.(extractDir);
+      await this.options.fileSystem.makeDirectory(cacheDir);
+      await this.options.fileSystem.makeDirectory(extractDir);
+    }
 
     this.emitStatus("validating");
     let resolved = await this.resolveExtracted(extractDir);

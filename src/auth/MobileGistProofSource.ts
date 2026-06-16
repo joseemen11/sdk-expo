@@ -31,6 +31,7 @@ const merkletree = require("@iden3/js-merkletree") as MerkletreeRuntime;
 export interface MobileGistProofRequest {
   network?: string;
   isStateGenesis?: boolean;
+  allowResolverFallback?: boolean;
 }
 
 export interface MobileGistProof {
@@ -58,6 +59,9 @@ export interface MobileGistProofSourceDebugInfo {
   stateContractAttempted: boolean;
   stateContractErrorMessage?: string;
   fallbackReason?: string;
+  rawResultLength?: number;
+  abiFunctionSignature?: string;
+  decodedShape?: string;
 }
 
 export interface ReadOnlyMobileGistProofSourceOptions {
@@ -93,6 +97,7 @@ export class ReadOnlyMobileGistProofSource implements MobileGistProofSource {
 
   async getGISTProof(holderDid: string, request: MobileGistProofRequest = {}): Promise<MobileGistProof | undefined> {
     this.lastDebugInfo = createInitialDebugInfo(this.rpcUrl, this.stateContractAddress);
+    const allowResolverFallback = request.allowResolverFallback ?? true;
     if (!this.didResolverUrl && !this.canReadStateContract()) {
       throw new Error("AuthV2 GIST resolver is not configured.");
     }
@@ -105,7 +110,7 @@ export class ReadOnlyMobileGistProofSource implements MobileGistProofSource {
         return proof;
       } catch (error) {
         this.lastDebugInfo.stateContractErrorMessage = summarizeDebugError(error);
-        if (!this.didResolverUrl) {
+        if (!this.didResolverUrl || !allowResolverFallback) {
           throw normalizeGistError(error, request);
         }
         this.lastDebugInfo.fallbackReason = `state-contract failed: ${summarizeDebugError(error)}`;
@@ -177,6 +182,7 @@ export class ReadOnlyMobileGistProofSource implements MobileGistProofSource {
 
   private async getStateContractGistProof(holderDid: string): Promise<MobileGistProof> {
     const id = deriveHolderId(holderDid);
+    this.lastDebugInfo.abiFunctionSignature = "getGISTProof(uint256)((uint256,bool,uint256[64],uint256,uint256,bool,uint256,uint256))";
     const response = this.rpcAdapter
       ? await this.rpcAdapter.readContract<unknown>({
           chainId: this.chainId as number,
@@ -187,7 +193,10 @@ export class ReadOnlyMobileGistProofSource implements MobileGistProofSource {
           args: [id]
         })
       : await this.readStateContractGistProof(id);
-    return normalizeStateContractGistProof(response);
+    this.lastDebugInfo.rawResultLength = resultLength(response);
+    const proof = normalizeStateContractGistProof(response);
+    this.lastDebugInfo.decodedShape = `root:boolean:siblings[${proof.siblings.length}]:index:value:aux`;
+    return proof;
   }
 
   private canReadStateContract(): boolean {
@@ -423,6 +432,16 @@ function stringArrayField(record: Record<string, unknown>, key: string): string[
   return value.map((item) => String(item));
 }
 
+function resultLength(value: unknown): number | undefined {
+  if (Array.isArray(value)) {
+    return value.length;
+  }
+  if (isRecord(value) && typeof value.length === "number") {
+    return value.length;
+  }
+  return undefined;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) {
     throw new Error("AuthV2 GIST proof response shape is unsupported.");
@@ -478,14 +497,14 @@ export const stateContractGistAbi = [
         components: [
           { internalType: "uint256", name: "root", type: "uint256" },
           { internalType: "bool", name: "existence", type: "bool" },
-          { internalType: "uint256[]", name: "siblings", type: "uint256[]" },
+          { internalType: "uint256[64]", name: "siblings", type: "uint256[64]" },
           { internalType: "uint256", name: "index", type: "uint256" },
           { internalType: "uint256", name: "value", type: "uint256" },
           { internalType: "bool", name: "auxExistence", type: "bool" },
           { internalType: "uint256", name: "auxIndex", type: "uint256" },
           { internalType: "uint256", name: "auxValue", type: "uint256" }
         ],
-        internalType: "struct StateInfo.GistProof",
+        internalType: "struct IState.GistProof",
         name: "",
         type: "tuple"
       }
@@ -506,7 +525,7 @@ export const stateContractGistAbi = [
           { internalType: "uint256", name: "createdAtBlock", type: "uint256" },
           { internalType: "uint256", name: "replacedAtBlock", type: "uint256" }
         ],
-        internalType: "struct StateInfo.RootInfo",
+        internalType: "struct IState.GistRootInfo",
         name: "",
         type: "tuple"
       }

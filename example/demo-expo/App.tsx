@@ -18,9 +18,11 @@ import {
   EncryptedIdentityStorage,
   ExpoSecureKeyStore,
   JsonLdContextStore,
+  joinUri,
   MobileBjjKmsAdapter,
   RapidsnarkNativeProver,
   ReadOnlyMobileGistProofSource,
+  resolveZipCircuitArtifacts,
   SQLiteCredentialRecordStore,
   SQLiteKeyValueStore,
   createPrivadoExpoClient,
@@ -30,6 +32,7 @@ import {
   type ImportedCredentialSummary,
   type IssuerClaimDebugStep,
   type GeneratedProof,
+  type PreparedCredentialAtomicQuerySigV2OnChainProof,
   type PrivadoExpoClient,
   type PrivadoExpoConfig,
   type CircuitArtifactDescriptor,
@@ -80,6 +83,9 @@ const defaultIssuerDid = expoPublicEnv(
 );
 const defaultIssuerBasicUser = expoPublicEnv("ISSUER_BASIC_USER", "user-issuer");
 const defaultIssuerBasicPass = expoPublicEnv("ISSUER_BASIC_PASS", "");
+const defaultMtpHydrationAttempts = expoPublicEnvNumber("MTP_HYDRATION_ATTEMPTS", 10);
+const defaultMtpHydrationDelayMs = expoPublicEnvNumber("MTP_HYDRATION_DELAY_MS", 3000);
+const defaultAllowExistingMtpFallback = expoPublicEnv("ALLOW_EXISTING_MTP_CREDENTIAL_FALLBACK", "true") === "true";
 const defaultCredentialSchema = expoPublicEnv(
   "CREDENTIAL_SCHEMA",
   "https://ipfs.io/ipfs/QmeQhwtwP6XNG155M49yV6TFmm6s8er13WfeU7tcuM8eat"
@@ -96,10 +102,16 @@ const defaultOnchainValidatorAddress = expoPublicEnv(
   "VALIDATOR_V3_ADDRESS",
   "0xC616963610A5545EF89b373e1fEAE8A1e505FaFF"
 );
+const defaultMtpOnchainRequestId = expoPublicEnv("MTP_ONCHAIN_REQUEST_ID", "1781504080");
+const defaultMtpOnchainValidatorAddress = expoPublicEnv(
+  "VALIDATOR_MTP_V2_ADDRESS",
+  "0x27bDFFCeC5478a648f89764E22fE415486A42Ede"
+);
 const defaultOnchainChallengeAddress = expoPublicEnv(
   "ONCHAIN_CHALLENGE_ADDRESS",
   "0x176A3cd0e7d9B0936f594015eADF313Fd46558E7"
 );
+const showLegacySigV2Debug = false;
 
 const config: PrivadoExpoConfig = {
   network: {
@@ -180,7 +192,9 @@ const issuerBasicPasswordSecureStoreKey = "privado-id.demo.issuer-basic-password
 const requiredDemoCircuits = [
   CircuitId.AuthV2,
   CircuitId.CredentialAtomicQuerySigV2,
-  CircuitId.CredentialAtomicQuerySigV2OnChain
+  CircuitId.CredentialAtomicQuerySigV2OnChain,
+  CircuitId.CredentialAtomicQueryMTPV2,
+  CircuitId.CredentialAtomicQueryMTPV2OnChain
 ];
 
 export default function App() {
@@ -191,8 +205,11 @@ export default function App() {
     preparedProof: GeneratedProof;
     requestId: string;
     challengeAddress: string;
+    validatorAddress: string;
     directVerifierDebugPath?: string;
     circuitInputsDebugPath?: string;
+    proverDebugPaths?: Record<string, string>;
+    mtpPreflight?: Awaited<ReturnType<typeof assertMtpProofPreflight>>;
   } | undefined>(undefined);
   const [importedCredential, setImportedCredential] = useState<unknown>();
   const [summaries, setSummaries] = useState<ImportedCredentialSummary[]>([]);
@@ -245,7 +262,8 @@ export default function App() {
       randomBytes: Crypto.getRandomBytes
     });
     const witnessCalculator = new CircomWitnessNativeCalculator({
-      graphReader: createExpoWitnessGraphReader()
+      graphReader: createExpoWitnessGraphReader(),
+      witnessWriter: createExpoWitnessFileWriter()
     });
     const nativeProver = new RapidsnarkNativeProver({
       fileInspector: createExpoProverFileInspector()
@@ -339,6 +357,7 @@ export default function App() {
         zipExtractor: createReactNativeZipExtractor(),
         artifactStore: circuitArtifactStore,
         version: "downloaded",
+        forceRefresh: true,
         onStatus: (phase) => setCircuitDownloadPhase(phase)
       });
       const result = await downloader.prepare();
@@ -359,8 +378,59 @@ export default function App() {
     }
   }
 
-  async function ensureSigV2CircuitArtifacts(
-    circuitId: CircuitId.CredentialAtomicQuerySigV2 | CircuitId.CredentialAtomicQuerySigV2OnChain =
+  async function checkCachedCircuits(): Promise<unknown> {
+    const fileSystem = createExpoCircuitFileSystemAdapter();
+    const baseDir = fileSystem.cacheDirectory ?? fileSystem.documentDirectory;
+    if (!baseDir) {
+      throw new Error("Circuit cache directory is not available.");
+    }
+    const extractDir = joinUri(joinUri(baseDir, "privado-id-circuits"), "extracted");
+    const resolved = await resolveZipCircuitArtifacts({
+      extractDir,
+      requiredCircuits: requiredDemoCircuits,
+      version: "downloaded",
+      fileExists: (path) => fileSystem.exists(path)
+    });
+    if (resolved.missing.length === 0) {
+      for (const descriptor of resolved.descriptors) {
+        circuitArtifactStore.register(descriptor);
+      }
+    }
+    const results = requiredDemoCircuits.map((circuitId) => {
+      const artifact = circuitArtifactStore.resolve(circuitId) ?? resolved.descriptors.find((item) => item.circuitId === circuitId);
+      const validation = circuitArtifactStore.validate(circuitId, "native");
+      const missingFiles = resolved.missing.filter((entry) => entry.includes(circuitId) || entry.includes(circuitId.replace(/^credential/, "credential")));
+      return {
+        circuitId,
+        cached: Boolean(artifact),
+        registered: Boolean(circuitArtifactStore.resolve(circuitId)),
+        valid: validation.valid,
+        graphPath: summarizePath(artifact?.graph?.localPath ?? artifact?.graphPath),
+        zkeyPath: summarizePath(artifact?.zkey?.localPath ?? artifact?.zkeyPath),
+        datPath: summarizePath(artifact?.dat?.localPath ?? artifact?.datPath),
+        missingFiles: missingFiles.length > 0 ? missingFiles : validation.missing,
+        needsDownload: !artifact || !validation.valid
+      };
+    });
+    const summaries = results
+      .map((item) => circuitArtifactStore.resolve(item.circuitId))
+      .filter((descriptor): descriptor is CircuitArtifactDescriptor => Boolean(descriptor))
+      .map(toCircuitSummary);
+    setCircuitSummaries(summaries);
+    return {
+      extractDir: summarizePath(extractDir),
+      circuits: results,
+      needsDownload: results.some((item) => item.needsDownload),
+      message: results.some((item) => item.needsDownload) ? "Run Download circuits." : "Cached circuits registered."
+    };
+  }
+
+  async function ensureCredentialCircuitArtifacts(
+    circuitId:
+      | CircuitId.CredentialAtomicQuerySigV2
+      | CircuitId.CredentialAtomicQuerySigV2OnChain
+      | CircuitId.CredentialAtomicQueryMTPV2
+      | CircuitId.CredentialAtomicQueryMTPV2OnChain =
       CircuitId.CredentialAtomicQuerySigV2
   ): Promise<unknown> {
     let validation = circuitArtifactStore.validate(circuitId, "native");
@@ -396,6 +466,9 @@ export default function App() {
     setCircuitSummaries(summaries);
     return {
       circuitId,
+      graphPath: summarizePath(graphPath),
+      zkeyPath: summarizePath(zkeyPath),
+      datPath: summarizePath(artifact.dat?.localPath ?? artifact.datPath),
       graphExists: true,
       graphSizeBytes: graphSize,
       zkeyExists: true,
@@ -430,16 +503,31 @@ export default function App() {
     };
   }
 
+  async function ensureJsonLdContextsForCredentialId(sdk: PrivadoExpoClient, credentialId: string): Promise<unknown> {
+    const credential = await sdk.getCredentialById(credentialId);
+    if (!credential) {
+      throw new Error("Saved credential was not found for JSON-LD context check.");
+    }
+    const contextStore = createDemoJsonLdContextStore();
+    return ensureContextsForCredentialWithSummary(
+      contextStore,
+      credential,
+      normalizeContextUrls(issuerCredentialContext)
+    );
+  }
+
   async function prepareOnchainProofForLatestCredential(): Promise<{
     preparedProof: GeneratedProof;
     summary: Awaited<ReturnType<PrivadoExpoClient["generateCredentialAtomicQuerySigV2OnChainProof"]>>;
     requestId: string;
     challengeAddress: string;
+    validatorAddress: string;
     directVerifierDebugPath?: string;
     circuitInputsDebugPath?: string;
+    proverDebugPaths?: Record<string, string>;
   }> {
     const sdk = await getSdk();
-    await ensureSigV2CircuitArtifacts(CircuitId.CredentialAtomicQuerySigV2OnChain);
+    await ensureCredentialCircuitArtifacts(CircuitId.CredentialAtomicQuerySigV2OnChain);
     const list = summaries.length > 0 ? summaries : await refreshCredentialSummaries();
     const summary = selectLatestCredentialSummary(list);
     if (!summary) {
@@ -481,6 +569,7 @@ export default function App() {
       : undefined;
     if (circuitInputsDebugPath && prepared.debugCircuitInputs) {
       const artifact = circuitArtifactStore.resolve(CircuitId.CredentialAtomicQuerySigV2OnChain);
+      const artifactDebug = await resolveArtifactDebugHashes(artifact);
       await FileSystem.writeAsStringAsync(
         circuitInputsDebugPath,
         JSON.stringify({
@@ -491,15 +580,12 @@ export default function App() {
             field: prepared.debugCircuitInputs.field,
             operator: prepared.debugCircuitInputs.operator,
             value: prepared.debugCircuitInputs.value,
-            wcdSha256:
-              artifact?.hashes?.graph ??
-              artifact?.graph?.sha256 ??
-              "not-computed-in-demo",
-            zkeySha256:
-              artifact?.hashes?.zkey ??
-              artifact?.zkey?.sha256 ??
-              "not-computed-in-demo",
+            inputSha256: prepared.debugCircuitInputs.inputSha256,
+            wcdSha256: artifactDebug.wcdSha256,
+            datSha256: artifactDebug.datSha256,
+            zkeySha256: artifactDebug.zkeySha256,
             graphPath: prepared.debugCircuitInputs.graphPath,
+            datPath: prepared.debugCircuitInputs.datPath,
             zkeyPath: prepared.debugCircuitInputs.zkeyPath,
             inputKeys: prepared.debugCircuitInputs.inputKeys,
             challengeEncoding: prepared.debugCircuitInputs.challengeEncoding,
@@ -511,20 +597,209 @@ export default function App() {
         })
       );
     }
+    const proverDebugPaths = await writeOnchainProverDebugFiles(prepared);
     onchainPreparedProofRef.current = {
       preparedProof: prepared.preparedProof,
       requestId: String(prepared.preparedProof.request.id),
       challengeAddress: prepared.summary.challengeAddress ?? defaultOnchainChallengeAddress.toLowerCase(),
+      validatorAddress: defaultOnchainValidatorAddress,
       directVerifierDebugPath,
-      circuitInputsDebugPath
+      circuitInputsDebugPath,
+      proverDebugPaths
     };
     return {
       ...prepared,
       requestId: String(prepared.preparedProof.request.id),
       challengeAddress: prepared.summary.challengeAddress ?? defaultOnchainChallengeAddress.toLowerCase(),
+      validatorAddress: defaultOnchainValidatorAddress,
       directVerifierDebugPath,
-      circuitInputsDebugPath
+      circuitInputsDebugPath,
+      proverDebugPaths
     };
+  }
+
+  async function prepareMtpOnchainProofForLatestCredential(): Promise<{
+    preparedProof: GeneratedProof;
+    summary: Awaited<ReturnType<PrivadoExpoClient["generateCredentialAtomicQueryMTPV2OnChainProof"]>>;
+    requestId: string;
+    challengeAddress: string;
+    validatorAddress: string;
+    directVerifierDebugPath?: string;
+    circuitInputsDebugPath?: string;
+    proverDebugPaths?: Record<string, string>;
+    mtpPreflight?: Awaited<ReturnType<typeof assertMtpProofPreflight>>;
+  }> {
+    const sdk = await getSdk();
+    const artifactDebug = await ensureCredentialCircuitArtifacts(CircuitId.CredentialAtomicQueryMTPV2OnChain);
+    const list = summaries.length > 0 ? summaries : await refreshCredentialSummaries();
+    const summary = selectLatestMtpCredentialSummary(list);
+    if (!summary) {
+      throw new Error("No saved credential with Iden3SparseMerkleTreeProof is available for MTP proof.");
+    }
+    const mtpPreflight = await assertMtpProofPreflight({
+      sdk,
+      summary,
+      circuitId: CircuitId.CredentialAtomicQueryMTPV2OnChain,
+      artifactDebug,
+      requestId: defaultMtpOnchainRequestId,
+      validator: defaultMtpOnchainValidatorAddress
+    });
+    await ensureJsonLdContextsForCredentialId(sdk, summary.id);
+    const prepared = await sdk.generateCredentialAtomicQueryMTPV2OnChainPreparedProof({
+      credentialId: summary.id,
+      credentialType: summary.type.find((item) => item !== "VerifiableCredential") ?? issuerCredentialType,
+      issuerDid: summary.issuer,
+      schema: issuerCredentialSchema,
+      query: {
+        field: "birthDate",
+        operator: "eq",
+        value: defaultCredentialValue
+      },
+      mode: "onchain",
+      circuitId: CircuitId.CredentialAtomicQueryMTPV2OnChain,
+      onchain: {
+        requestId: defaultMtpOnchainRequestId,
+        universalVerifierAddress: config.contracts.universalVerifierAddress,
+        validatorAddress: defaultMtpOnchainValidatorAddress,
+        challengeAddress: defaultOnchainChallengeAddress
+      }
+    });
+    const directVerifierDebugPath = FileSystem.documentDirectory
+      ? `${FileSystem.documentDirectory}mtp-onchain-direct-verifier-debug.json`
+      : undefined;
+    if (directVerifierDebugPath) {
+      await FileSystem.writeAsStringAsync(
+        directVerifierDebugPath,
+        JSON.stringify({
+          preparedProof: prepared.preparedProof,
+          proofSource: prepared.summary.proofSource,
+          publicSignalsSource: prepared.summary.publicSignalsSource
+        })
+      );
+    }
+    const circuitInputsDebugPath = FileSystem.documentDirectory
+      ? `${FileSystem.documentDirectory}mtp-onchain-circuit-inputs-debug.json`
+      : undefined;
+    if (circuitInputsDebugPath && prepared.debugCircuitInputs) {
+      const artifact = circuitArtifactStore.resolve(CircuitId.CredentialAtomicQueryMTPV2OnChain);
+      const artifactDebug = await resolveArtifactDebugHashes(artifact);
+      await FileSystem.writeAsStringAsync(
+        circuitInputsDebugPath,
+        JSON.stringify({
+          metadata: {
+            circuitId: prepared.debugCircuitInputs.circuitId,
+            requestId: prepared.debugCircuitInputs.requestId,
+            credentialType: prepared.debugCircuitInputs.credentialType,
+            field: prepared.debugCircuitInputs.field,
+            operator: prepared.debugCircuitInputs.operator,
+            value: prepared.debugCircuitInputs.value,
+            inputSha256: prepared.debugCircuitInputs.inputSha256,
+            wcdSha256: artifactDebug.wcdSha256,
+            datSha256: artifactDebug.datSha256,
+            zkeySha256: artifactDebug.zkeySha256,
+            graphPath: prepared.debugCircuitInputs.graphPath,
+            datPath: prepared.debugCircuitInputs.datPath,
+            zkeyPath: prepared.debugCircuitInputs.zkeyPath,
+            inputKeys: prepared.debugCircuitInputs.inputKeys,
+            challengeEncoding: prepared.debugCircuitInputs.challengeEncoding,
+            challengeSignatureValid: prepared.debugCircuitInputs.challengeSignatureValid,
+            issuerClaimSignatureValid: prepared.debugCircuitInputs.issuerClaimSignatureValid,
+            inputBuilderFailureLayer: prepared.debugCircuitInputs.inputBuilderFailureLayer
+          },
+          inputs: prepared.debugCircuitInputs.inputs
+        })
+      );
+    }
+    const proverDebugPaths = await writeOnchainProverDebugFiles(prepared);
+    onchainPreparedProofRef.current = {
+      preparedProof: prepared.preparedProof,
+      requestId: String(prepared.preparedProof.request.id),
+      challengeAddress: prepared.summary.challengeAddress ?? defaultOnchainChallengeAddress.toLowerCase(),
+      validatorAddress: defaultMtpOnchainValidatorAddress,
+      directVerifierDebugPath,
+      circuitInputsDebugPath,
+      proverDebugPaths,
+      mtpPreflight
+    };
+    return {
+      ...prepared,
+      requestId: String(prepared.preparedProof.request.id),
+      challengeAddress: prepared.summary.challengeAddress ?? defaultOnchainChallengeAddress.toLowerCase(),
+      validatorAddress: defaultMtpOnchainValidatorAddress,
+      directVerifierDebugPath,
+      circuitInputsDebugPath,
+      proverDebugPaths,
+      mtpPreflight
+    };
+  }
+
+  async function writeOnchainProverDebugFiles(
+    prepared: PreparedCredentialAtomicQuerySigV2OnChainProof
+  ): Promise<Record<string, string> | undefined> {
+    if (!FileSystem.documentDirectory || !prepared.debugProverOutputs) {
+      return undefined;
+    }
+    const baseDir = FileSystem.documentDirectory;
+    const paths = {
+      rawProof: `${baseDir}rapidsnark-proof-raw.json`,
+      rawPublic: `${baseDir}rapidsnark-public-raw.json`,
+      snarkjsProof: `${baseDir}mobile-proof-snarkjs.json`,
+      publicSignals: `${baseDir}mobile-public-signals.json`,
+      calldataProof: `${baseDir}mobile-proof-calldata.json`,
+      metadata: `${baseDir}rapidsnark-run-metadata.json`
+    };
+    await Promise.all(Object.values(paths).map((path) => deleteFileIfExists(path)));
+    await FileSystem.writeAsStringAsync(
+      paths.rawProof,
+      prepared.debugProverOutputs.rawProof ?? JSON.stringify(prepared.debugProverOutputs.proofSnarkjs)
+    );
+    await FileSystem.writeAsStringAsync(
+      paths.rawPublic,
+      prepared.debugProverOutputs.rawPublicSignals ?? JSON.stringify(prepared.debugProverOutputs.publicSignals)
+    );
+    await FileSystem.writeAsStringAsync(
+      paths.snarkjsProof,
+      JSON.stringify(prepared.debugProverOutputs.proofSnarkjs, null, 2)
+    );
+    await FileSystem.writeAsStringAsync(
+      paths.publicSignals,
+      JSON.stringify(prepared.debugProverOutputs.publicSignals, null, 2)
+    );
+    await FileSystem.writeAsStringAsync(
+      paths.calldataProof,
+      JSON.stringify(
+        prepared.debugProverOutputs.proofCalldata ?? { error: prepared.debugProverOutputs.proofCalldataError },
+        null,
+        2
+      )
+    );
+    await FileSystem.writeAsStringAsync(
+      paths.metadata,
+      JSON.stringify(
+        {
+          runId: prepared.debugProverOutputs.runId,
+          startedAt: prepared.debugProverOutputs.startedAt,
+          finishedAt: prepared.debugProverOutputs.finishedAt,
+          zkeyPath: prepared.debugProverOutputs.zkeyPath,
+          witnessSource: prepared.debugProverOutputs.witnessSource,
+          inputByteLength: prepared.debugProverOutputs.inputByteLength,
+          inputSha256: prepared.debugProverOutputs.inputSha256,
+          witnessByteLength: prepared.debugProverOutputs.witnessByteLength,
+          witnessSha256: prepared.debugProverOutputs.witnessSha256,
+          witnessFilePath: prepared.debugProverOutputs.witnessPath,
+          circuitId: prepared.summary.circuitId,
+          requestId: prepared.summary.requestId,
+          publicSignalsCount: prepared.summary.publicSignalsCount,
+          files: {
+            ...paths,
+            witness: prepared.debugProverOutputs.witnessPath
+          }
+        },
+        null,
+        2
+      )
+    );
+    return paths;
   }
 
   const isActionRunning = Boolean(runningAction);
@@ -601,24 +876,7 @@ export default function App() {
             />
             <DemoButton
               label="Check circuits"
-              onPress={() =>
-                run("Check circuits", async () => {
-                  const results = requiredDemoCircuits.map((circuitId) => ({
-                    circuitId,
-                    validation: circuitArtifactStore.validate(circuitId, "native"),
-                    artifact: circuitArtifactStore.resolve(circuitId)
-                  }));
-                  const summaries = results
-                    .filter((item) => item.artifact)
-                    .map((item) => toCircuitSummary(item.artifact as CircuitArtifactDescriptor));
-                  setCircuitSummaries(summaries);
-                  return results.map((item) => ({
-                    circuitId: item.circuitId,
-                    valid: item.validation.valid,
-                    missing: item.validation.missing
-                  }));
-                })
-              }
+              onPress={() => run("Check circuits", checkCachedCircuits)}
             />
           </StepSection>
 
@@ -640,7 +898,8 @@ export default function App() {
                   });
                   const proof = await gistProofSource.getGISTProof(identity.did, {
                     network: identity.network,
-                    isStateGenesis: true
+                    isStateGenesis: true,
+                    allowResolverFallback: false
                   });
                   if (!proof) {
                     throw new Error("AuthV2 GIST proof could not be generated safely.");
@@ -791,7 +1050,10 @@ export default function App() {
                     credentialSaved: result.credentialSaved,
                     credentialType: result.credentialType,
                     issuerDid: result.issuerDid,
-                    storageId: result.storageId
+                    storageId: result.storageId,
+                    issuerCredentialId: result.issuerCredentialId,
+                    mtpReady: result.mtpReady,
+                    mtpStatus: result.mtpStatus
                   };
                 })
               }
@@ -830,6 +1092,9 @@ export default function App() {
                     credentialType: result.credentialType,
                     issuerDid: result.issuerDid,
                     storageId: result.storageId,
+                    issuerCredentialId: result.issuerCredentialId,
+                    mtpReady: result.mtpReady,
+                    mtpStatus: result.mtpStatus,
                     steps: summarizeIssuerDebugSteps(result.steps)
                   };
                 })
@@ -842,6 +1107,34 @@ export default function App() {
               label="Refresh saved credentials"
               {...buttonState("Refresh saved credentials", "Loading...")}
               onPress={() => run("Refresh saved credentials", refreshCredentialSummaries)}
+            />
+            <DemoButton
+              label="Refetch MTP credential from issuer"
+              {...buttonState("Refetch MTP credential", "Hydrating...")}
+              onPress={() =>
+                run("Refetch MTP credential", async () => {
+                  const sdk = await getSdk();
+                  const summary = selectLatestPendingMtpCredentialSummary(summaries.length > 0 ? summaries : await refreshCredentialSummaries());
+                  const result = await sdk.refetchMtpCredentialFromIssuer({
+                    storageId: summary?.id,
+                    credentialId: summary?.issuerCredentialId,
+                    credentialType: issuerCredentialType,
+                    credentialSchema: issuerCredentialSchema,
+                    allowExistingMtpCredentialFallback: defaultAllowExistingMtpFallback
+                  });
+                  await refreshCredentialSummaries();
+                  return {
+                    credentialSaved: result.credentialSaved,
+                    storageId: result.storageId,
+                    issuerCredentialId: result.issuerCredentialId,
+                    mtpReady: result.mtpReady,
+                    mtpStatus: result.mtpStatus,
+                    proofTypes: result.proofTypes,
+                    message: result.message,
+                    steps: summarizeIssuerDebugSteps(result.steps)
+                  };
+                })
+              }
             />
             <DemoButton
               label="Get credential summary by ID"
@@ -863,12 +1156,68 @@ export default function App() {
               onPress={() => run("Ensure JSON-LD contexts", ensureJsonLdContextsForLatestCredential)}
             />
             <DemoButton
-              label="Generate credential proof off-chain"
+              label="Generate credential MTP proof off-chain"
+              {...buttonState("Credential MTP proof", "Generating...")}
+              onPress={() =>
+                run("Credential MTP proof", async () => {
+                  const sdk = await getSdk();
+                  const artifactDebug = await ensureCredentialCircuitArtifacts(CircuitId.CredentialAtomicQueryMTPV2);
+                  const list = summaries.length > 0 ? summaries : await refreshCredentialSummaries();
+                  const summary = selectLatestMtpCredentialSummary(list);
+                  if (!summary) {
+                    throw new Error("No saved credential with Iden3SparseMerkleTreeProof is available for MTP proof.");
+                  }
+                  const preflight = await assertMtpProofPreflight({
+                    sdk,
+                    summary,
+                    circuitId: CircuitId.CredentialAtomicQueryMTPV2,
+                    artifactDebug
+                  });
+                  await ensureJsonLdContextsForCredentialId(sdk, summary.id);
+                  const result = await sdk.generateCredentialAtomicQueryMTPV2Proof({
+                    credentialId: summary.id,
+                    credentialType: summary.type.find((item) => item !== "VerifiableCredential") ?? issuerCredentialType,
+                    issuerDid: summary.issuer,
+                    schema: issuerCredentialSchema,
+                    query: {
+                      field: "birthDate",
+                      operator: "eq",
+                      value: defaultCredentialValue
+                    },
+                    mode: "offchain",
+                    circuitId: CircuitId.CredentialAtomicQueryMTPV2
+                  });
+                  return {
+                    proofGenerated: result.proofGenerated,
+                    circuitId: result.circuitId,
+                    proofType: "Iden3SparseMerkleTreeProof",
+                    selectedCircuitId: preflight.selectedCircuitId,
+                    selectedProofType: preflight.selectedProofType,
+                    selectedProofFromCredential: preflight.selectedProofFromCredential,
+                    mtpReady: preflight.mtpReady,
+                    graphPath: preflight.graphPath,
+                    zkeyPath: preflight.zkeyPath,
+                    datPath: preflight.datPath,
+                    builder: preflight.builder,
+                    credentialId: summary.id,
+                    credentialType: result.credentialType,
+                    field: result.field,
+                    operator: result.operator,
+                    proofRoute: result.proofRoute,
+                    publicSignalsCount: result.publicSignalsCount,
+                    publicSignalsSource: result.publicSignalsSource,
+                    proofSource: result.proofSource
+                  };
+                })
+              }
+            />
+            {showLegacySigV2Debug ? <DemoButton
+              label="Generate credential SigV2 proof off-chain (legacy)"
               {...buttonState("Credential proof", "Generating...")}
               onPress={() =>
                 run("Credential proof", async () => {
                   const sdk = await getSdk();
-                  await ensureSigV2CircuitArtifacts();
+                  await ensureCredentialCircuitArtifacts(CircuitId.CredentialAtomicQuerySigV2);
                   const list = summaries.length > 0 ? summaries : await refreshCredentialSummaries();
                   const summary = selectLatestCredentialSummary(list);
                   if (!summary) {
@@ -899,9 +1248,47 @@ export default function App() {
                   };
                 })
               }
-            />
+            /> : null}
             <DemoButton
-              label="Generate credential proof on-chain"
+              label="Generate credential MTP proof on-chain"
+              {...buttonState("Credential MTP proof on-chain", "Generating...")}
+              onPress={() =>
+                run("Credential MTP proof on-chain", async () => {
+                  const { summary: result, directVerifierDebugPath, circuitInputsDebugPath } =
+                    await prepareMtpOnchainProofForLatestCredential();
+                  const mtpPreflight = onchainPreparedProofRef.current?.mtpPreflight;
+                  return {
+                    proofGenerated: result.proofGenerated,
+                    mode: result.mode,
+                    circuitId: result.circuitId,
+                    proofType: "Iden3SparseMerkleTreeProof",
+                    selectedCircuitId: result.circuitId,
+                    selectedProofType: "Iden3SparseMerkleTreeProof",
+                    selectedProofFromCredential: "Iden3SparseMerkleTreeProof",
+                    mtpReady: mtpPreflight?.mtpReady ?? true,
+                    graphPath: mtpPreflight?.graphPath,
+                    zkeyPath: mtpPreflight?.zkeyPath,
+                    datPath: mtpPreflight?.datPath,
+                    builder: mtpPreflight?.builder,
+                    credentialType: result.credentialType,
+                    field: result.field,
+                    operator: result.operator,
+                    proofRoute: result.proofRoute,
+                    requestId: result.requestId,
+                    validator: defaultMtpOnchainValidatorAddress,
+                    challengeAddress: result.challengeAddress,
+                    publicSignalsCount: result.publicSignalsCount,
+                    publicSignalsSource: result.publicSignalsSource,
+                    proofSource: result.proofSource,
+                    directVerifierDebugPath,
+                    circuitInputsDebugPath,
+                    proverDebugPaths: onchainPreparedProofRef.current?.proverDebugPaths
+                  };
+                })
+              }
+            />
+            {showLegacySigV2Debug ? <DemoButton
+              label="Generate credential SigV2 proof on-chain (legacy)"
               {...buttonState("Credential proof on-chain", "Generating...")}
               onPress={() =>
                 run("Credential proof on-chain", async () => {
@@ -921,11 +1308,12 @@ export default function App() {
                     publicSignalsSource: result.publicSignalsSource,
                     proofSource: result.proofSource,
                     directVerifierDebugPath,
-                    circuitInputsDebugPath
+                    circuitInputsDebugPath,
+                    proverDebugPaths: onchainPreparedProofRef.current?.proverDebugPaths
                   };
                 })
               }
-            />
+            /> : null}
             <TextInput
               accessibilityLabel="EVM private key"
               value={evmPrivateKey}
@@ -973,20 +1361,16 @@ export default function App() {
                   }
                   const sdk = await getSdk();
                   const cached = onchainPreparedProofRef.current;
-                  if (cached && cached.requestId !== defaultOnchainRequestId) {
-                    onchainPreparedProofRef.current = undefined;
-                    throw new Error("Prepared on-chain proof was generated for a stale requestId. Generate credential proof on-chain again.");
-                  }
-                  const prepared = cached ?? (await prepareOnchainProofForLatestCredential());
-                  if (String(prepared.preparedProof.request.id) !== defaultOnchainRequestId) {
-                    throw new Error("Prepared on-chain proof requestId does not match current Universal Verifier requestId.");
-                  }
+                  const prepared = cached ?? (await prepareMtpOnchainProofForLatestCredential());
+                  const validatorAddress = "validatorAddress" in prepared
+                    ? prepared.validatorAddress
+                    : onchainPreparedProofRef.current?.validatorAddress ?? defaultMtpOnchainValidatorAddress;
                   const submitInput = {
                     preparedProof: prepared.preparedProof,
                     requestId: String(prepared.preparedProof.request.id),
                     evmPrivateKey,
                     challengeAddress: prepared.challengeAddress,
-                    validatorAddress: defaultOnchainValidatorAddress,
+                    validatorAddress,
                     rpcUrl: config.network.rpcUrl,
                     universalVerifierAddress: config.contracts.universalVerifierAddress,
                     chainId: config.network.chainId
@@ -1010,6 +1394,14 @@ export default function App() {
                       registeredOperator: debug.registeredOperator,
                       registeredValue: debug.registeredValue,
                       proofCircuitId: debug.proofCircuitId,
+                      challengeMode: debug.challengeMode,
+                      expectedChallenge: debug.expectedChallenge,
+                      requestParamsChallenge: debug.requestParamsChallenge,
+                      submitMethod: debug.submitMethod,
+                      selector: debug.selector,
+                      proofResponsesCount: debug.proofResponsesCount,
+                      pubSignalsLength: debug.pubSignalsLength,
+                      signalIndexes: debug.signalIndexes,
                       publicSignalsCount: debug.publicSignalsCount,
                       calldataProofFormat: debug.calldataProofFormat,
                       piBOrder: debug.piBOrder,
@@ -1044,10 +1436,18 @@ export default function App() {
                     proofCircuitId: result.calldataDebug?.proofCircuitId,
                     proofOperator: result.calldataDebug?.proofOperator,
                     proofValue: result.calldataDebug?.proofValue,
+                    challengeMode: result.calldataDebug?.challengeMode,
+                    expectedChallenge: result.calldataDebug?.expectedChallenge,
+                    requestParamsChallenge: result.calldataDebug?.requestParamsChallenge,
                     challengeFromPublicSignal: result.calldataDebug?.challengeFromPublicSignal,
                     challengeMatchesExpected: result.calldataDebug?.challengeMatchesExpected,
                     challengeMatchesSigner: result.calldataDebug?.challengeMatchesSigner,
                     signerMatchesChallenge: result.calldataDebug?.signerMatchesChallenge,
+                    submitMethod: result.calldataDebug?.submitMethod,
+                    selector: result.calldataDebug?.selector,
+                    proofResponsesCount: result.calldataDebug?.proofResponsesCount,
+                    pubSignalsLength: result.calldataDebug?.pubSignalsLength,
+                    signalIndexes: result.calldataDebug?.signalIndexes,
                     publicSignalsCount: result.calldataDebug?.publicSignalsCount,
                     calldataProofFormat: result.calldataDebug?.calldataProofFormat,
                     piBOrder: result.calldataDebug?.piBOrder,
@@ -1247,13 +1647,18 @@ function createConfiguredDemoConfig(input: IssuerDemoConfig): PrivadoExpoConfig 
       issuerDid: input.issuerDid,
       issuerBaseUrl: config.issuer?.issuerBaseUrl,
       issuerAdminBase: input.issuerAdminBase,
-      basicAuth:
-        input.issuerBasicUser && input.issuerBasicPass
-          ? {
-              username: input.issuerBasicUser,
-              password: input.issuerBasicPass
-            }
-          : undefined
+    basicAuth:
+      input.issuerBasicUser && input.issuerBasicPass
+        ? {
+            username: input.issuerBasicUser,
+            password: input.issuerBasicPass
+          }
+          : undefined,
+      credentialHydration: {
+        proofPollAttempts: defaultMtpHydrationAttempts,
+        proofPollDelayMs: defaultMtpHydrationDelayMs,
+        allowExistingMtpCredentialFallback: defaultAllowExistingMtpFallback
+      }
     },
     credential: {
       credentialType: input.credentialType,
@@ -1322,6 +1727,9 @@ function SavedCredentialCard({ summary }: { summary: ImportedCredentialSummary }
       <Text style={styles.summaryLine}>Issuer DID: {summary.issuer ?? "Unknown"}</Text>
       <Text style={styles.summaryLine}>Subject DID/id: {summary.credentialSubjectId ?? "Unknown"}</Text>
       <Text style={styles.summaryLine}>Proof types: {summary.proofTypes.join(", ") || "None"}</Text>
+      <Text style={styles.summaryLine}>Issuer credential ID: {summary.issuerCredentialId ?? "Unknown"}</Text>
+      <Text style={styles.summaryLine}>MTP ready: {summary.mtpReady ? "true" : "false"}</Text>
+      <Text style={styles.summaryLine}>MTP status: {summary.mtpStatus ?? "unknown"}</Text>
       <Text style={styles.summaryLine}>Created: {summary.createdAt ?? "Unknown"}</Text>
       <Text style={styles.summaryLine}>Updated: {summary.updatedAt ?? "Unknown"}</Text>
     </View>
@@ -1387,6 +1795,7 @@ function summarizeIssuerDebugSteps(steps: IssuerClaimDebugStep[]) {
     messageIdFormat: step.messageIdFormat,
     threadIdFormat: step.threadIdFormat,
     credentialSummary: step.credentialSummary,
+    hydration: step.hydration,
     error: typeof step.error === "string" ? summarizeError(step.error) : undefined
   }));
 }
@@ -1472,6 +1881,91 @@ function selectLatestCredentialSummary(summaries: ImportedCredentialSummary[]): 
   })[0];
 }
 
+function selectLatestMtpCredentialSummary(summaries: ImportedCredentialSummary[]): ImportedCredentialSummary | undefined {
+  return selectLatestCredentialSummary(
+    summaries.filter((summary) => summary.mtpReady === true && summary.proofTypes.includes("Iden3SparseMerkleTreeProof"))
+  );
+}
+
+async function assertMtpProofPreflight(input: {
+  sdk: PrivadoExpoClient;
+  summary: ImportedCredentialSummary;
+  circuitId: CircuitId.CredentialAtomicQueryMTPV2 | CircuitId.CredentialAtomicQueryMTPV2OnChain;
+  artifactDebug: unknown;
+  requestId?: string;
+  validator?: string;
+}): Promise<{
+  selectedCircuitId: CircuitId;
+  selectedProofType: "Iden3SparseMerkleTreeProof";
+  selectedProofFromCredential: "Iden3SparseMerkleTreeProof";
+  credentialId: string;
+  mtpReady: boolean;
+  graphPath?: string;
+  zkeyPath?: string;
+  datPath?: string;
+  requestId?: string;
+  validator?: string;
+  builder: "MobileCredentialAtomicQueryMTPV2InputBuilder";
+}> {
+  if (
+    input.circuitId !== CircuitId.CredentialAtomicQueryMTPV2 &&
+    input.circuitId !== CircuitId.CredentialAtomicQueryMTPV2OnChain
+  ) {
+    throw new Error("MTP flow routed to SigV2 by mistake");
+  }
+  if (input.summary.mtpReady !== true || !input.summary.proofTypes.includes("Iden3SparseMerkleTreeProof")) {
+    throw new Error("MTP flow routed to SigV2 by mistake: selected credential is not MTP-ready.");
+  }
+  const credential = await input.sdk.getCredentialById(input.summary.id);
+  const proofTypes = readProofTypesFromCredential(credential);
+  if (!proofTypes.includes("Iden3SparseMerkleTreeProof")) {
+    throw new Error("MTP flow routed to SigV2 by mistake: saved credential JSON does not contain Iden3SparseMerkleTreeProof.");
+  }
+  if (proofTypes.includes("BJJSignature2021") && !proofTypes.includes("Iden3SparseMerkleTreeProof")) {
+    throw new Error("MTP flow routed to SigV2 by mistake");
+  }
+  const artifact = typeof input.artifactDebug === "object" && input.artifactDebug !== null
+    ? input.artifactDebug as { graphPath?: string; zkeyPath?: string; datPath?: string }
+    : {};
+  return {
+    selectedCircuitId: input.circuitId,
+    selectedProofType: "Iden3SparseMerkleTreeProof",
+    selectedProofFromCredential: "Iden3SparseMerkleTreeProof",
+    credentialId: input.summary.id,
+    mtpReady: input.summary.mtpReady === true,
+    graphPath: artifact.graphPath,
+    zkeyPath: artifact.zkeyPath,
+    datPath: artifact.datPath,
+    requestId: input.requestId,
+    validator: input.validator,
+    builder: "MobileCredentialAtomicQueryMTPV2InputBuilder"
+  };
+}
+
+function readProofTypesFromCredential(credential: unknown): string[] {
+  if (!credential || typeof credential !== "object" || Array.isArray(credential)) {
+    return [];
+  }
+  const proof = (credential as { proof?: unknown }).proof;
+  const proofs = Array.isArray(proof) ? proof : proof ? [proof] : [];
+  return proofs
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .map((item) => item.type)
+    .flatMap((type) => Array.isArray(type) ? type : [type])
+    .filter((type): type is string => typeof type === "string" && type.length > 0);
+}
+
+function selectLatestPendingMtpCredentialSummary(summaries: ImportedCredentialSummary[]): ImportedCredentialSummary | undefined {
+  return selectLatestCredentialSummary(
+    summaries.filter((summary) =>
+      summary.mtpReady !== true &&
+      (Boolean(summary.issuerCredentialId) ||
+        summary.mtpStatus === "pending-mtp-hydration" ||
+        summary.mtpStatus === "claimed-bjj-only")
+    )
+  ) ?? selectLatestCredentialSummary(summaries);
+}
+
 async function ensureContextsForCredentialWithSummary(
   store: JsonLdContextStore,
   credential: unknown,
@@ -1540,6 +2034,50 @@ function createExpoWitnessGraphReader() {
   };
 }
 
+function createExpoWitnessFileWriter() {
+  return {
+    writeWitnessBase64: async ({
+      circuitId,
+      witnessBase64
+    }: {
+      circuitId: CircuitId;
+      witnessBase64: string;
+    }) => {
+      const baseDirectory = FileSystem.cacheDirectory ?? FileSystem.documentDirectory;
+      if (!baseDirectory) {
+        throw new Error("Expo file system cache directory is not available for witness persistence.");
+      }
+      const directory = `${baseDirectory}privado-id-witness/`;
+      const directoryInfo = await FileSystem.getInfoAsync(directory);
+      if (!directoryInfo.exists) {
+        await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+      }
+      const witnessPath = `${directory}${safeCircuitFileName(circuitId)}.wtns`;
+      await deleteFileIfExists(witnessPath);
+      await FileSystem.writeAsStringAsync(witnessPath, witnessBase64, {
+        encoding: FileSystem.EncodingType.Base64
+      });
+      const info = await FileSystem.getInfoAsync(witnessPath, { size: true });
+      if (!info.exists) {
+        throw new Error("Witness file was not written.");
+      }
+      const sizeBytes = "size" in info && typeof info.size === "number" ? info.size : decodedBase64Size(witnessBase64);
+      if (sizeBytes <= 0) {
+        throw new Error("Witness file is empty.");
+      }
+      const persistedBase64 = await FileSystem.readAsStringAsync(witnessPath, {
+        encoding: FileSystem.EncodingType.Base64
+      });
+      return {
+        witnessPath,
+        witnessBase64: persistedBase64,
+        sizeBytes,
+        sha256: "not-computed-on-device"
+      };
+    }
+  };
+}
+
 function createExpoProverFileInspector() {
   return {
     inspectFile: async (path: string) => {
@@ -1550,6 +2088,40 @@ function createExpoProverFileInspector() {
       };
     }
   };
+}
+
+function safeCircuitFileName(circuitId: CircuitId): string {
+  return circuitId.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function decodedBase64Size(value: string): number {
+  const normalized = value.replace(/\s/g, "");
+  if (!normalized) {
+    return 0;
+  }
+  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
+}
+
+async function resolveArtifactDebugHashes(
+  descriptor: CircuitArtifactDescriptor | undefined
+): Promise<{
+  wcdSha256?: string;
+  datSha256?: string;
+  zkeySha256?: string;
+}> {
+  const graphPath = descriptor?.graph?.localPath ?? descriptor?.graphPath;
+  const datPath = descriptor?.dat?.localPath ?? descriptor?.datPath;
+  const zkeyPath = descriptor?.zkey?.localPath ?? descriptor?.zkeyPath;
+  return {
+    wcdSha256: descriptor?.hashes?.graph ?? descriptor?.graph?.sha256 ?? notComputedForPath(graphPath),
+    datSha256: descriptor?.hashes?.dat ?? descriptor?.dat?.sha256 ?? notComputedForPath(datPath),
+    zkeySha256: descriptor?.hashes?.zkey ?? descriptor?.zkey?.sha256 ?? notComputedForPath(zkeyPath)
+  };
+}
+
+function notComputedForPath(path: string | undefined): string | undefined {
+  return path ? "not-computed-on-device" : undefined;
 }
 
 function toCircuitSummary(descriptor: CircuitArtifactDescriptor): CircuitSummary {
@@ -1568,6 +2140,13 @@ function summarizePath(path: string | undefined): string | undefined {
   }
   const parts = path.split("/");
   return parts.slice(Math.max(0, parts.length - 3)).join("/");
+}
+
+async function deleteFileIfExists(path: string): Promise<void> {
+  const info = await FileSystem.getInfoAsync(path);
+  if (info.exists) {
+    await FileSystem.deleteAsync(path, { idempotent: true });
+  }
 }
 
 function summarizeError(message: string): string {

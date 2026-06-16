@@ -40,6 +40,16 @@ export const defaultZipCircuitExpectedFiles: ZipCircuitExpectedFileMap = {
     dat: "credentialAtomicQuerySigV2OnChain.dat",
     wcd: "credentialAtomicQuerySigV2OnChain.wcd",
     zkey: "credentialAtomicQuerySigV2OnChain.zkey"
+  },
+  [CircuitId.CredentialAtomicQueryMTPV2]: {
+    dat: "credentialAtomicQueryMTPV2.dat",
+    wcd: "credentialAtomicQueryMTPV2.wcd",
+    zkey: "credentialAtomicQueryMTPV2.zkey"
+  },
+  [CircuitId.CredentialAtomicQueryMTPV2OnChain]: {
+    dat: "credentialAtomicQueryMTPV2OnChain.dat",
+    wcd: "credentialAtomicQueryMTPV2OnChain.wcd",
+    zkey: "credentialAtomicQueryMTPV2OnChain.zkey"
   }
 };
 

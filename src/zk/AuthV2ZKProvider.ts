@@ -16,6 +16,11 @@ export interface NativeWitnessCalculatorResult {
   witnessPath?: string;
   witness?: unknown;
   publicSignals?: unknown;
+  witnessSource?: "base64" | "file" | "unknown";
+  witnessByteLength?: number;
+  witnessSha256?: string;
+  inputByteLength?: number;
+  inputSha256?: string;
 }
 
 export interface NativeWitnessCalculator {
@@ -27,11 +32,23 @@ export interface NativeProverInput {
   zkeyPath: string;
   witnessPath?: string;
   witness?: unknown;
+  witnessByteLength?: number;
+  witnessSha256?: string;
 }
 
 export interface NativeProverResult {
   proof: unknown;
   publicSignals?: unknown;
+  rawProof?: string;
+  rawPublicSignals?: string;
+  runId?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  zkeyPath?: string;
+  witnessSource?: "base64" | "file" | "unknown";
+  witnessPath?: string;
+  witnessByteLength?: number;
+  witnessSha256?: string;
 }
 
 export interface NativeProver {
@@ -93,7 +110,9 @@ export class AuthV2ZKProvider implements ZKProvider {
       circuitId: CircuitId.AuthV2,
       zkeyPath,
       witnessPath: witnessResult.witnessPath,
-      witness: witnessResult.witness
+      witness: witnessResult.witness,
+      witnessByteLength: witnessResult.witnessByteLength,
+      witnessSha256: witnessResult.witnessSha256
     });
 
     return {
