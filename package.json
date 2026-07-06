@@ -4,6 +4,15 @@
   "description": "Privado ID SDK for Expo and React Native.",
   "license": "MIT",
   "type": "commonjs",
+  "keywords": [
+    "privado-id",
+    "polygonid",
+    "expo",
+    "react-native",
+    "zero-knowledge",
+    "verifiable-credentials"
+  ],
+  "sideEffects": false,
   "main": "dist/index.js",
   "react-native": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,7 +27,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "package.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -86,6 +86,8 @@ const appConfig = {
   credentialType: 'PersonCredential',
   requestId: '<REQUEST_ID>',
   challengeAddress: '<CHALLENGE_ADDRESS>',
+  didResolverUrl: '<DID_RESOLVER_URL>',
+  circuitsBaseUrl: '<CIRCUITS_BASE_URL>',
 };
 
 const sdkConfig = {
@@ -99,7 +101,7 @@ const sdkConfig = {
     universalVerifierAddress: appConfig.universalVerifierAddress,
   },
   didResolver: {
-    didResolverUrl: '<DID_RESOLVER_URL>',
+    didResolverUrl: appConfig.didResolverUrl,
   },
   issuer: {
     issuerDid: appConfig.issuerDid,
@@ -116,26 +118,48 @@ const sdkConfig = {
 };
 ```
 
-| Field | Description | Required | Example placeholder |
-| --- | --- | --- | --- |
-| `chainId` | EVM chain id used by the target network. | Yes | `80002` |
-| `network` | Human-readable network name. | Yes | `polygon-amoy` |
-| `rpcUrl` | RPC endpoint used for contract reads and transaction submission. | Yes for on-chain flows | `<YOUR_RPC_URL>` |
-| `stateContractAddress` | Privado ID state contract address. | Yes for AuthV2/on-chain proofs | `<STATE_CONTRACT_ADDRESS>` |
-| `universalVerifierAddress` | UniversalVerifier contract address. | Yes for proof submission | `<UNIVERSAL_VERIFIER_ADDRESS>` |
-| `validatorAddress` | Validator registered for the MTP proof request. | Yes for on-chain request matching | `<MTP_VALIDATOR_ADDRESS>` |
-| `issuerBaseUrl` | Issuer service base URL. | Yes for claim/synchronization flows | `<ISSUER_BASE_URL>` |
-| `issuerDid` | DID of the credential issuer. | Yes | `<ISSUER_DID>` |
-| `credentialSchema` | Credential schema URL. | Yes for credential proof requests | `<CREDENTIAL_SCHEMA_URL>` |
-| `credentialContext` | JSON-LD credential context URL. | Yes for merklized proofs | `<CREDENTIAL_CONTEXT_URL>` |
-| `credentialType` | Verifiable credential type. | Yes | `PersonCredential` |
-| `requestId` | UniversalVerifier request id. | Yes for on-chain proofs | `<REQUEST_ID>` |
-| `challengeAddress` | EVM sender address used to derive the on-chain challenge. | Yes for on-chain proofs | `<CHALLENGE_ADDRESS>` |
+| Field | Description | Required | Sensitive? | Example placeholder |
+| --- | --- | --- | --- | --- |
+| `chainId` | EVM chain id used by the target network. | Yes | No | `80002` |
+| `network` | Human-readable network name. | Yes | No | `polygon-amoy` |
+| `rpcUrl` | RPC endpoint used for contract reads and transaction submission. | Yes for on-chain flows | Sometimes | `<YOUR_RPC_URL>` |
+| `stateContractAddress` | Privado ID State Contract address. | Yes for AuthV2/on-chain proofs | No | `<STATE_CONTRACT_ADDRESS>` |
+| `universalVerifierAddress` | UniversalVerifier contract address. | Yes for proof submission | No | `<UNIVERSAL_VERIFIER_ADDRESS>` |
+| `validatorAddress` | Validator registered for the MTP proof request. | Yes for on-chain request matching | No | `<MTP_VALIDATOR_ADDRESS>` |
+| `issuerBaseUrl` | Issuer service base URL. | Yes for claim/synchronization flows | No | `<ISSUER_BASE_URL>` |
+| `issuerDid` | DID of the credential issuer. | Yes | No | `<ISSUER_DID>` |
+| `credentialSchema` | Credential schema URL. | Yes for credential proof requests | No | `<CREDENTIAL_SCHEMA_URL>` |
+| `credentialContext` | JSON-LD credential context URL. | Yes for merklized proofs | No | `<CREDENTIAL_CONTEXT_URL>` |
+| `credentialType` | Verifiable credential type. | Yes | No | `PersonCredential` |
+| `requestId` | UniversalVerifier request id. | Yes for on-chain proofs | No | `<REQUEST_ID>` |
+| `challengeAddress` | EVM sender address used to derive the on-chain challenge. | Yes for on-chain proofs | No | `<CHALLENGE_ADDRESS>` |
+| `didResolverUrl` | DID Resolver endpoint used for identity and state lookups. | Yes for DID resolution flows | No | `<DID_RESOLVER_URL>` |
+| `circuitsBaseUrl` | Application-controlled circuit artifact source. | Yes when downloading circuits | Sometimes | `<CIRCUITS_BASE_URL>` |
+
+Public mobile configuration can include network identifiers, contract addresses, issuer DID, schema/context URLs, request ids, and circuit artifact locations. Do not put private keys, seed phrases, issuer Basic Auth, administrative issuer credentials, or production-only secrets in `EXPO_PUBLIC_*` variables.
+
+## Required adapters
+
+The SDK core is adapter-based. A production application should provide the capabilities that match its architecture:
+
+| Capability | SDK interface/class | Purpose |
+| --- | --- | --- |
+| Secure key storage | `SecureKeyStore`, `ExpoSecureKeyStore` | Store encryption keys and holder key material. |
+| Credential storage | `CredentialStorageAdapter`, `EncryptedCredentialStorage` | Store encrypted VC payloads and safe summaries. |
+| Identity storage | `IdentityStorageAdapter`, `EncryptedIdentityStorage` | Persist Holder DID metadata. |
+| Circuit artifacts | `CircuitArtifactStore`, `CircuitArtifactDownloader`, `CircuitArtifactFileSystemAdapter`, `ZipExtractor` | Register, validate, download, and extract `.wcd`, `.zkey`, and `.dat` files. |
+| Witness calculation | `NativeWitnessCalculator`, `CircomWitnessNativeCalculator` | Calculate native witnesses from circuit inputs and `.wcd` graphs. |
+| Proof generation | `NativeProver`, `RapidsnarkNativeProver` | Generate Groth16 proofs from witness and `.zkey` artifacts. |
+| RPC/network access | `RPCAdapter`, `FetchHttpClient` | Read contracts and issuer/resolver endpoints. |
+| Transaction submission | `ZkpTxSubmitter` or application signer/wallet integration | Submit prepared proofs using the app's signer strategy. |
 
 ## Basic usage
 
 ```ts
-import { createPrivadoExpoClient } from '@privado-id/expo-sdk';
+import {
+  createPrivadoExpoClient,
+  prepareUniversalVerifierCalldata,
+} from '@privado-id/expo-sdk';
 
 const client = createPrivadoExpoClient(sdkConfig, adapters);
 await client.init();
@@ -271,11 +295,33 @@ This uses `credentialAtomicQueryMTPV2OnChain` and prepares a proof compatible wi
 
 ## Submitting proof to UniversalVerifier
 
+For production applications, prefer an application-controlled signer, wallet connector, Smart Account, or transaction submitter. The SDK exposes `prepareUniversalVerifierCalldata` so applications can submit with their own signer architecture.
+
+```ts
+import { prepareUniversalVerifierCalldata } from '@privado-id/expo-sdk';
+
+const calldata = prepareUniversalVerifierCalldata(
+  preparedProof.preparedProof,
+  '<REQUEST_ID>',
+);
+
+const tx = await signerAdapter.submitZKPResponse({
+  universalVerifierAddress: '<UNIVERSAL_VERIFIER_ADDRESS>',
+  requestId: calldata.requestId,
+  inputs: calldata.inputs,
+  a: calldata.a,
+  b: calldata.b,
+  c: calldata.c,
+});
+```
+
+The SDK also provides `client.submitOnchainProofToUniversalVerifier` for local demos and controlled development builds. That helper currently accepts an `evmPrivateKey` input so it can derive the signer and submit directly:
+
 ```ts
 const tx = await client.submitOnchainProofToUniversalVerifier({
   preparedProof: preparedProof.preparedProof,
   requestId: '<REQUEST_ID>',
-  evmPrivateKey: '<EVM_PRIVATE_KEY_FROM_SECURE_STORAGE>',
+  evmPrivateKey: await secureSignerStore.getPrivateKey(),
   rpcUrl: '<YOUR_RPC_URL>',
   universalVerifierAddress: '<UNIVERSAL_VERIFIER_ADDRESS>',
   challengeAddress: '<CHALLENGE_ADDRESS>',
@@ -284,7 +330,9 @@ const tx = await client.submitOnchainProofToUniversalVerifier({
 });
 ```
 
-The SDK prepares calldata for the UniversalVerifier-compatible submit method and performs a read-only preflight before sending. The result can include:
+Use this direct helper only when the private key is loaded from secure local storage or a controlled development environment. Do not hardcode private keys, commit them to GitHub, or place them in `EXPO_PUBLIC_*` variables.
+
+The submit result can include:
 
 - `txHash`
 - `receiptStatus`
@@ -292,7 +340,7 @@ The SDK prepares calldata for the UniversalVerifier-compatible submit method and
 - `verificationResult`
 - challenge/signer validation status
 
-Do not hardcode EVM private keys in application code. Load signing material from a secure wallet or secure storage flow.
+The UniversalVerifier submission path uses a UniversalVerifier-compatible submit method.
 
 ## Querying on-chain verification result
 
@@ -410,16 +458,19 @@ export function createPrivadoIdentityService(config, adapters) {
       });
     },
 
-    async submit(preparedProof, evmPrivateKey) {
-      return client.submitOnchainProofToUniversalVerifier({
-        preparedProof: preparedProof.preparedProof,
-        requestId: '<REQUEST_ID>',
-        evmPrivateKey,
-        rpcUrl: '<YOUR_RPC_URL>',
+    async submit(preparedProof, signerAdapter) {
+      const calldata = prepareUniversalVerifierCalldata(
+        preparedProof.preparedProof,
+        '<REQUEST_ID>',
+      );
+
+      return signerAdapter.submitZKPResponse({
         universalVerifierAddress: '<UNIVERSAL_VERIFIER_ADDRESS>',
-        challengeAddress: '<CHALLENGE_ADDRESS>',
-        validatorAddress: '<MTP_VALIDATOR_ADDRESS>',
-        chainId: 80002,
+        requestId: calldata.requestId,
+        inputs: calldata.inputs,
+        a: calldata.a,
+        b: calldata.b,
+        c: calldata.c,
       });
     },
 
